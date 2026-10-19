@@ -1,0 +1,63 @@
+RatSweepr Free — Source-Available License (All Rights Reserved)
+Copyright (c) 2026 Jorge Díaz. All rights reserved.
+
+This is not an open-source license. It is written in plain language and is
+not a substitute for legal advice; if you need a legally reviewed version
+for a specific use case, contact hello@ratsweepr.com.
+
+1. Permitted use
+
+   You may:
+   - view and read the source code of this software ("RatSweepr Free");
+   - download, install, and run RatSweepr Free, unmodified, on websites
+     and servers that you own or are authorized to administer — this
+     includes a freelancer or agency running it on a client's site, as
+     long as you don't do the things listed in Section 2 below;
+   - take and act on the plain-text reports it produces, for any site you
+     own or are authorized to administer, including a client's;
+   - share a scan report (redacted or not) with the copyright holder or
+     others for malware-research purposes, such as using the built-in
+     `share-report` feature to help improve detection signatures.
+
+2. Not permitted
+
+   Without prior written permission from the copyright holder, you may
+   not:
+   - redistribute, publish, mirror, or re-host this software or any part
+     of its source code, modified or unmodified;
+   - create or distribute derivative works, forks, or modified versions;
+   - sublicense, sell, rent, or otherwise transfer any rights granted by
+     this license to a third party;
+   - bundle this software, or any part of it, into a product or service
+     you offer, sell, or distribute to others — including giving a copy
+     of it to a client, or packaging it as part of your own hosting,
+     security, consulting, or managed-WordPress offering. Using it
+     yourself to scan a client's site is fine (Section 1); handing them
+     (or anyone else) the script, or folding it into something you sell,
+     is not.
+
+   The paid RatSweepr Cleanup Kit and Done-For-You service are distributed
+   separately by the copyright holder and are not covered or affected by
+   this license.
+
+3. No warranty
+
+   THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+   RATSWEEPR FREE IS A DETECTION TOOL, NOT A GUARANTEE: IT MAY MISS
+   MALWARE, PRODUCE FALSE POSITIVES, OR BOTH. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+4. Termination
+
+   Any use outside the permissions granted in Section 1 automatically
+   terminates your rights under this license. The copyright holder may
+   also grant additional or different rights to specific parties in
+   writing (for example, under a separate commercial agreement), which
+   does not change the terms of this license for anyone else.
+
+For anything not covered above — commercial redistribution, bundling into
+another product, contributing a patch, or a different license for a
+specific case — contact hello@ratsweepr.com.

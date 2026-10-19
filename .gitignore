@@ -1,0 +1,17 @@
+# build artifacts (don't track them)
+/dist/
+/ratsweepr
+/ratsweepr-linux-*
+/ratsweepr-darwin-*
+# scan output and redacted copies - never commit
+*.report
+*.shared.report
+# signing key - never commit
+priv.pem
+# private/dev-only notes - never commit to the public repo
+CLAUDE_CODE_PROMPT*.md
+VERIFY.md
+CONTEXT.md
+CHANGELOG.json
+# OS cruft
+.DS_Store

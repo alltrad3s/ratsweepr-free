@@ -1,0 +1,49 @@
+name: ci-release
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n ratsweepr.sh
+      - name: ratsweepr.yar matches the bundled heredoc
+        run: make yara-sync
+      - name: Tag mirrors RS_VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver="$(grep '^RS_VERSION=' ratsweepr.sh | cut -d'"' -f2)"
+          [ "v$ver" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != v$ver"; exit 1; }
+      - name: Validate YARA ruleset compiles
+        run: |
+          ver=v1.19.0
+          url="https://github.com/VirusTotal/yara-x/releases/download/$ver/yara-x-$ver-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$url" | tar -xz yr && chmod +x yr
+          ./yr scan ratsweepr.yar /dev/null && echo "rules compile OK"
+
+  release:
+    needs: lint
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checksums
+        run: sha256sum ratsweepr.sh ratsweepr.yar ratsweepr-sigs.conf install.sh > SHA256SUMS
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ratsweepr.sh
+            ratsweepr.yar
+            ratsweepr-sigs.conf
+            install.sh
+            SHA256SUMS
+          generate_release_notes: true
