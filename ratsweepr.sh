@@ -37,7 +37,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.20-free"
+RS_VERSION="2.9.21-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -1724,7 +1724,13 @@ scan_blockchain_js_loader() {
     # exceeds 255") on anything larger; chaining keeps every individual count
     # under that limit while still requiring the same total run length.
     local longrun='([A-Za-z0-9+/]{100}){27,}[A-Za-z0-9+/]*={0,2}'
-    local f rel candidate decoded n
+    local f rel candidate n tmp
+    # Decode into a file, never a variable: a base64 constant can legitimately
+    # decode to binary (an embedded font/image), and bash's $(...) prints
+    # "warning: command substitution: ignored null byte in input" to stderr
+    # for every such candidate - harmless but noisy (seen ~15x on a real
+    # site). One reused tmp file for the whole function; removed on return.
+    tmp="$(mktemp "${TMPDIR:-/tmp}/rs-b64js.XXXXXX")" || return
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
@@ -1733,18 +1739,22 @@ scan_blockchain_js_loader() {
         n=0
         while IFS= read -r candidate && [ "$n" -lt 5 ]; do
             n=$((n+1))
-            decoded="$(printf '%s' "$candidate" | { base64 -d 2>/dev/null || openssl base64 -d -A 2>/dev/null; })"
-            [ -n "$decoded" ] || continue
-            if printf '%s' "$decoded" | grep -qF "eth_call" \
-               && printf '%s' "$decoded" | grep -qiE '(sepolia|/rpc|tenderly|publicnode)' \
-               && { printf '%s' "$decoded" | grep -qF "crypto.subtle" \
-                    || printf '%s' "$decoded" | grep -qF "localStorage"; }; then
+            printf '%s' "$candidate" | { base64 -d 2>/dev/null || openssl base64 -d -A 2>/dev/null; } > "$tmp" 2>/dev/null
+            [ -s "$tmp" ] || continue
+            # skip binary decodes (images/fonts/etc.) before running the IOC
+            # greps - a real JS payload never contains a NUL byte.
+            LC_ALL=C tr -d '\000' < "$tmp" | cmp -s - "$tmp" || continue
+            if LC_ALL=C grep -a -qF "eth_call" "$tmp" \
+               && LC_ALL=C grep -a -qiE '(sepolia|/rpc|tenderly|publicnode)' "$tmp" \
+               && { LC_ALL=C grep -a -qF "crypto.subtle" "$tmp" \
+                    || LC_ALL=C grep -a -qF "localStorage" "$tmp"; }; then
                 report "HIGH" "blockchain-js-loader" "$rel" \
                     "a >2KB base64 constant decodes to JS calling eth_call against an RPC endpoint (sepolia/rpc/tenderly/publicnode) plus crypto.subtle/localStorage - blockchain-hosted malware loader"
                 break
             fi
         done < <(grep -oE "$longrun" "$f" 2>/dev/null)
     done < "$PHPLIST"
+    rm -f "$tmp"
 }
 
 # scan_rankmath_readonly_indicators: published IOCs a file/content rule can't
@@ -2232,20 +2242,30 @@ scan_malicious_options() {
     local P="${DBPREFIX:-wp_}"
 
     if have base64 || have openssl; then
-        db_query "SELECT option_name, option_value FROM ${P}options
-                  WHERE LENGTH(option_value) > 200
-                    AND option_value REGEXP '^[A-Za-z0-9+/=[:space:]]+\$'
-                  LIMIT 500;" \
-        | while IFS=$'\t' read -r name val; do
-            [ -n "$name" ] && [ -n "$val" ] || continue
-            local decoded
-            decoded="$(printf '%s' "$val" | tr -d '[:space:]' | { base64 -d 2>/dev/null || openssl base64 -d -A 2>/dev/null; })"
-            [ -n "$decoded" ] || continue
-            if printf '%s' "$decoded" | grep -qE 'Function[[:space:]]*\(|\beval[[:space:]]*\(|atob[[:space:]]*\('; then
-                report "HIGH" "db-malicious-option" "option:$name" \
-                    "option value is a base64 blob decoding to JS containing Function()/eval()/atob() - attacker payload"
-            fi
-        done
+        # Decode into a file, never a variable - a base64 option value can
+        # legitimately decode to binary, and bash's $(...) warns on stderr
+        # ("ignored null byte in input") for every such row. One reused tmp
+        # file for the whole loop; removed when it ends.
+        local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/rs-b64opt.XXXXXX")" || tmp=""
+        if [ -n "$tmp" ]; then
+            db_query "SELECT option_name, option_value FROM ${P}options
+                      WHERE LENGTH(option_value) > 200
+                        AND option_value REGEXP '^[A-Za-z0-9+/=[:space:]]+\$'
+                      LIMIT 500;" \
+            | while IFS=$'\t' read -r name val; do
+                [ -n "$name" ] && [ -n "$val" ] || continue
+                printf '%s' "$val" | tr -d '[:space:]' | { base64 -d 2>/dev/null || openssl base64 -d -A 2>/dev/null; } > "$tmp" 2>/dev/null
+                [ -s "$tmp" ] || continue
+                # skip binary decodes before running the IOC grep - real JS
+                # malware never contains a NUL byte.
+                LC_ALL=C tr -d '\000' < "$tmp" | cmp -s - "$tmp" || continue
+                if LC_ALL=C grep -a -qE 'Function[[:space:]]*\(|\beval[[:space:]]*\(|atob[[:space:]]*\(' "$tmp"; then
+                    report "HIGH" "db-malicious-option" "option:$name" \
+                        "option value is a base64 blob decoding to JS containing Function()/eval()/atob() - attacker payload"
+                fi
+            done
+            rm -f "$tmp"
+        fi
     fi
 
     # cross-reference: option name(s) read by a confirmed wp_head JS-injector match
