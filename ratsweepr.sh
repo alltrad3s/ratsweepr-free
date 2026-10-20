@@ -37,7 +37,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.21-free"
+RS_VERSION="2.9.22-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -2568,9 +2568,19 @@ WF_SAW_CVE=0
 cache_age_secs() { # cache_age_secs FILE -> seconds since mtime, or 999999 if missing
     local f="$1" m now
     [ -f "$f" ] || { printf '%s' 999999; return; }
-    m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)"
+    # GNU stat first (most hosts are Linux): GNU's -f means "filesystem
+    # status", NOT "use this format" like BSD stat - stat -f %m on GNU
+    # coreutils treats "%m" as a FILE operand and errors, but still prints
+    # multi-line filesystem info to stdout for the real file operand, which
+    # command substitution happily captures as garbage. Try the GNU form
+    # first, BSD/macOS form second, and never trust the result without
+    # validating it's purely digits first.
+    m="$(stat -c %Y "$f" 2>/dev/null)"
+    case "$m" in ''|*[!0-9]*) m="$(stat -f %m "$f" 2>/dev/null)";; esac
+    case "$m" in ''|*[!0-9]*) printf '%s' 999999; return;; esac
     now="$(date +%s)"
-    if [ -n "$m" ]; then printf '%s' $(( now - m )); else printf '%s' 999999; fi
+    case "$now" in ''|*[!0-9]*) printf '%s' 999999; return;; esac
+    printf '%s' $(( now - m ))
 }
 
 mask_secret() { # mask_secret STRING -> first4...last4, or **** if too short to mask safely
