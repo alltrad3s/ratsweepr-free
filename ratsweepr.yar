@@ -9,8 +9,11 @@ rule RS_eval_user_input {
         description = "eval/assert of user-controlled input"
         severity = "HIGH"
     strings:
-        $a = /(eval|assert)\s*\(\s*(stripslashes\s*\()?\s*\$_(POST|GET|REQUEST|COOKIE)/ nocase
-        $b = /(eval|assert)\s*\(\s*\$[a-zA-Z_]+\s*\)/ nocase
+        // \b anchors avoid matching a plain function call like doubleval(...) or
+        // retrieval(...), both of which contain "eval(" as a bare substring -
+        // confirmed against a clean Gravity Forms copy, see VERIFY.md
+        $a = /\b(eval|assert)\s*\(\s*(stripslashes\s*\()?\s*\$_(POST|GET|REQUEST|COOKIE)/ nocase
+        $b = /\b(eval|assert)\s*\(\s*\$[a-zA-Z_]+\s*\)/ nocase
     condition:
         any of them
 }
@@ -130,13 +133,14 @@ rule RS_command_exec_fallback_chain {
 
 rule RS_hardcoded_secret_gated_exec {
     meta:
-        description = "Hardcoded-secret gated command-exec backdoor (hash_equals against fixed value then runs request-derived command)"
+        description = "Hardcoded-secret gated command-exec backdoor (hash_equals against fixed value then runs request-derived command), or the same hash_equals gate paired with a disable_functions= probe as a bonus tell"
         severity = "HIGH"
     strings:
         $h = /hash_equals\s*\(\s*["'][^"']{6,}["']\s*,\s*\$_(GET|POST|REQUEST|SERVER)/ nocase
         $e = /(system|passthru|shell_exec|exec|popen|proc_open)\s*\(\s*\$_(GET|POST|REQUEST)/ nocase
+        $df = "disable_functions=" nocase
     condition:
-        $h and $e
+        ($h and $e) or ($h and $df)
 }
 
 rule RS_globals_flood_backdoor {
@@ -389,4 +393,82 @@ rule RS_xss_hidden_admin_backdoor {
         $comment = "WP plugin load: do not run shell (keeps wp-admin normal)"
     condition:
         $comment
+}
+
+rule RS_rankmath_pro_supplychain_oct2026 {
+    meta:
+        description = "Rank Math SEO PRO supply-chain compromise (Oct 2026, CVE-2026-111862): backdoored packages of PRO 3.0.123 contain a C2 domain, randomized option/key markers and a disguised cron tag - matches on any one published IOC in a PHP file"
+        severity = "HIGH"
+    strings:
+        $php = "<?php"
+        $i1 = "rank1cdn.com"
+        $i2 = "xmmqhn"
+        $i3 = "_uf6qdn2hmm"
+        $i4 = "t8krdk990phb"
+        $i5 = "_np5pvf754c"
+        $i6 = "#ms6v46"
+        $i7 = "@wp-mail.net"
+    condition:
+        $php and 1 of ($i*)
+}
+
+rule RS_updraftcentral_variant2_oct2026_backdoor {
+    meta:
+        description = "UpdraftCentral key-compromise backdoor, second variant (Oct 2026 campaign): hides its planted editor account from the admin-list query/count (pre_user_query + pre_count_users) in addition to the hash_equals-gated wp_set_auth_cookie takeover"
+        severity = "HIGH"
+    strings:
+        $d1 = "keep service accounts out of the main user list"
+        $d2 = "Improves cron tasks efficiency for content sites with minimal overhead"
+        $hook1 = "pre_user_query"
+        $hook2 = "pre_count_users"
+        $c = "wp_set_auth_cookie"
+        $h = "hash_equals"
+    condition:
+        $d1 or $d2 or ($hook1 and $hook2 and $c and $h)
+}
+
+rule RS_option_js_injector_wp_head {
+    meta:
+        description = "wp_head-hooked PHP that echoes a <script> block built from a get_option() value and an obfuscated-call marker ([].constructor.constructor(atob( or Function(atob(), without the current_user_can('manage_options') gate a legitimate admin-notice script would have"
+        severity = "HIGH"
+    strings:
+        $hook = /add_action\s*\(\s*['"]wp_head['"]/ nocase
+        $script = "<script" nocase
+        $opt = /get_option\s*\(/ nocase
+        $cap = /current_user_can\s*\(\s*['"]manage_options['"]/ nocase
+        $m1 = "[].constructor.constructor(atob("
+        $m2 = "Function(atob("
+    condition:
+        $hook and $script and $opt and ($m1 or $m2) and not $cap
+}
+
+rule RS_rest_backdoor_keyed_open_route {
+    meta:
+        description = "Unauthenticated REST backdoor: register_rest_route() with permission_callback '__return_true', a GET-param key compared to a hardcoded literal, gating update_option/delete_option or WP_Filesystem->delete"
+        severity = "HIGH"
+    strings:
+        $route = /register_rest_route\s*\(/ nocase
+        $perm  = /permission_callback['"]?\s*=>\s*['"]__return_true['"]/ nocase
+        $key   = /get_param\s*\(\s*['"]key['"]\s*\)/ nocase
+        $cmp   = /(==|===)\s*['"][A-Za-z0-9_\-]{6,}['"]/
+        $opt1  = /update_option\s*\(/ nocase
+        $opt2  = /delete_option\s*\(/ nocase
+        $fsdel = /WP_Filesystem[^;]{0,60}->\s*delete\s*\(/ nocase
+    condition:
+        $route and $perm and $key and $cmp and ($opt1 or $opt2 or $fsdel)
+}
+
+rule RS_split_string_include {
+    meta:
+        description = "include/require of a filename reassembled from 2+ concatenated string fragments (e.g. __DIR__ . \"x\" . \"y.ph\" . \"p\") - evades static .php-extension grep; no legitimate reason to split a short filename like this"
+        severity = "HIGH"
+    strings:
+        // {0,80} not {0,80}?: yara-x and classic yara both reject mixing
+        // greedy and non-greedy quantifiers in one regex (E015 / "greedy
+        // and ungreedy quantifiers can't be mixed"). A bounded quantifier
+        // backtracks to the same match/no-match result either way, so this
+        // doesn't change which files the rule fires on.
+        $a = /\b(include|require|require_once|include_once)\s*\([^;{}]{0,80}['"][^'"]{0,40}['"]\s*\.\s*['"][^'"]{0,40}['"]\s*\.\s*['"][^'"]{0,40}['"]/ nocase
+    condition:
+        $a
 }

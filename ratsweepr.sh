@@ -37,7 +37,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.18-free"
+RS_VERSION="2.9.20-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -59,9 +59,12 @@ PATTERN_URL="${RS_PATTERN_URL:-}"
 # pattern files MUST verify or they are rejected.
 PATTERN_PUBKEY="$RS_HOME/ratsweepr-pub.pem"
 
-# Optional WPScan vulnerability API token (free tier available) for flagging
-# plugins with known CVEs:  export WPSCAN_API_TOKEN=xxxx
-WPSCAN_API_TOKEN="${WPSCAN_API_TOKEN:-}"
+# Optional Wordfence Intelligence API key (free, from your own account) for
+# the live vulnerability-feed check:  export WORDFENCE_API_KEY=xxxx
+# or add a "WORDFENCE_API_KEY=xxxx" line to $RS_HOME/config. Never required -
+# the scan runs and the hand-picked VULNPLUGIN list + outdated-plugin check
+# still work without one. Get a free key: https://www.wordfence.com/account/integrations
+WORDFENCE_API_KEY="${WORDFENCE_API_KEY:-}"
 
 # ------------------------------ tiny toolbox ---------------------------------
 C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[0;33m'
@@ -108,6 +111,11 @@ preflight() {
     HAVE_PHP=0;     have php     && HAVE_PHP=1
     HAVE_MYSQL=0;   have mysql   && HAVE_MYSQL=1
     HAVE_OPENSSL=0; have openssl && HAVE_OPENSSL=1
+
+    JSON_PARSER=""
+    if have jq; then JSON_PARSER="jq"
+    elif [ "$HAVE_PHP" = "1" ]; then JSON_PARSER="php"
+    fi
 
     # Refuse to run as root: on shared hosting you never should be, and a bug
     # as root is catastrophic. (Override only if you truly know why.)
@@ -172,7 +180,7 @@ write_default_patterns() {
 # --- generic webshell / injection constructs (high signal, still REVIEW) ---
 GREP|eval_base64|eval[[:space:]]*\(([[:space:]]*@)?[[:space:]]*base64_decode
 GREP|eval_gzinflate|eval[[:space:]]*\(([[:space:]]*@)?[[:space:]]*gz(inflate|uncompress)
-GREP|eval_request|(eval|assert)[[:space:]]*\([[:space:]]*(stripslashes[[:space:]]*\()?[[:space:]]*\$_(POST|GET|REQUEST|COOKIE)
+GREP|eval_request|\b(eval|assert)[[:space:]]*\([[:space:]]*(stripslashes[[:space:]]*\()?[[:space:]]*\$_(POST|GET|REQUEST|COOKIE)
 GREP|preg_replace_e_modifier|preg_replace[[:space:]]*\([[:space:]]*['\"][^'\"]*/[a-zA-Z]*e[a-zA-Z]*['\"]
 GREP|create_function_request|create_function[[:space:]]*\([^)]*\$_(POST|GET|REQUEST)
 GREP|str_rot13_base64|str_rot13[[:space:]]*\([[:space:]]*base64_decode
@@ -252,7 +260,8 @@ VULNPLUGIN|woo-product-bundle|8.6.7|CVE-2026-93836|yes|https://patchstack.com/ar
 VULNPLUGIN|bricksforge|3.1.8.10|CVE-2026-85097|yes|https://patchstack.com/articles/critical-unauthenticated-arbitrary-file-upload-vulnerability-exploited-in-bricksforge-plugin/|EXACT=4.0.0:unusual version jump not covered by the advisory - verify with the vendor that this build is genuinely past the fix
 VULNPLUGIN|elementor-pro|4.2.2|CVE-2026-32475|yes|https://thehackernews.com/2026/09/over-440000-exploit-attempts-target.html
 VULNPLUGIN|super-forms|6.3.314|CVE-2026-14894|yes|https://thehackernews.com/2026/09/over-440000-exploit-attempts-target.html
-VULNPLUGIN|updraftplus|1.26.5|CVE-2026-10795|no|https://github.com/advisories/GHSA-hc7f-qwfj-7fcf|ALTFIXED=2.26.5
+VULNPLUGIN|updraftplus|1.26.5|CVE-2026-10795|yes|https://patchstack.com/articles/updraftcentral-key-compromise-wordpress-backdoors/|ALTFIXED=2.26.5
+VULNPLUGIN|rank-math-pro|3.0.124|CVE-2026-111862|yes|https://rankmath.com/kb/pro-3-0-123-security-incident/|EXACT=3.0.123:Rank Math SEO PRO 3.0.123: some packages of this version were compromised (supply chain). Version alone doesn't prove infection; check the findings below and Rank Math's guide. Delete the rank-math-pro folder (deactivating isn't enough) and install 3.0.124.
 EOSIG
     ok "Wrote bundled heuristic patterns -> $RS_SIG_DIR/patterns.conf"
 }
@@ -441,8 +450,8 @@ scan_core_checksums() {
         warn "Checksum API returned no data for $WPVER."; return
     fi
 
-    local fails=0 faillist="$RS_CACHE/core-fails.$$"
-    : > "$faillist"
+    local fails=0 faillist="$RS_CACHE/core-fails.$$" bundled_missing="$RS_CACHE/core-bundled-missing.$$"
+    : > "$faillist"; : > "$bundled_missing"
     # md5sum -c reports FAILED / missing files; --quiet hides the OKs.
     while IFS= read -r line; do
         local f="${line%%:*}"
@@ -452,8 +461,11 @@ scan_core_checksums() {
                 case "$f" in
                     wp-config-sample.php) report "INFO" "core-sample-missing" "$f" \
                         "wp-config-sample.php absent - commonly removed as hardening, not an infection sign";;
-                    wp-content/*) report "INFO" "core-bundled-missing" "$f" \
-                        "bundled default theme/plugin file absent (often intentional)";;
+                    # Collapsed below into one INFO line per component (theme/plugin
+                    # dir) instead of one per missing file - a theme with its whole
+                    # unused language/template tree absent would otherwise flood
+                    # the report with dozens of near-identical lines.
+                    wp-content/*) printf '%s\n' "$f" >> "$bundled_missing";;
                     *) report "HIGH" "core-missing" "$f" "core file missing or unreadable";;
                 esac;;
             *": FAILED"*)
@@ -461,6 +473,17 @@ scan_core_checksums() {
         esac
         fails=$((fails+1))
     done < <(cd "$WPROOT" && md5sum -c --quiet "$manifest" 2>/dev/null)
+    if [ -s "$bundled_missing" ]; then
+        awk -F'/' '{
+            if (NF>=3 && ($2=="themes" || $2=="plugins" || $2=="mu-plugins")) comp=$2"/"$3
+            else comp=$2
+            cnt[comp]++
+        } END { for (c in cnt) printf "%s\t%d\n", c, cnt[c] }' "$bundled_missing" | sort \
+        | while IFS=$'\t' read -r comp bcnt; do
+            report "INFO" "core-bundled-missing" "wp-content/$comp" "$bcnt bundled file(s) absent (often intentional)"
+        done
+    fi
+    rm -f "$bundled_missing"
     # Every manifest file that did NOT fail is integrity-verified: heuristics
     # must never flag a file that is byte-identical to the official release.
     comm -23 <(awk '{print $2}' "$manifest" | sort) <(sort -u "$faillist") >> "$VERIFIED"
@@ -522,6 +545,76 @@ scan_fake_plugins() {
             report "HIGH" "fake-plugin-payload" "wp-content/plugins/$slug" \
                 "plugin ships a file literally named payload.php - almost always a malware dropper; verify manually (cleanup: RatSweepr Cleanup Kit / Done-For-You at ratsweepr.com)"
         fi
+    done
+}
+
+# scan_plugin_header_mismatch: a plugin's own declared header metadata can out a
+# fake/dropped plugin before any code pattern fires - a Text Domain unrelated to
+# its Plugin Name, a Text Domain with the same random-hex-suffix disguise
+# fake-plugin directory names use (here on the header field instead), or an
+# Author claiming to be WordPress.org/WordPress/Automattic on a plugin that
+# genuinely isn't theirs. Any ONE hit is MED (could be sloppy but real); two or
+# more on the SAME plugin is HIGH. Pure header-text checks, no php needed.
+scan_plugin_header_mismatch() {
+    [ -d "$WPROOT/wp-content/plugins" ] || return
+    local plugdir slug mainfile f line name textdomain author hits detail
+    # Automattic/core plugins that legitimately use these generic author strings.
+    local known_automattic="|akismet|jetpack|woocommerce|classic-editor|classic-widgets|wordpress-importer|wp-super-cache|vaultpress|polldaddy|"
+    for plugdir in "$WPROOT"/wp-content/plugins/*/; do
+        [ -d "$plugdir" ] || continue
+        slug="$(basename "$plugdir")"
+        mainfile=""
+        for f in "$plugdir"*.php; do
+            [ -f "$f" ] || continue
+            grep -qiE '^[[:space:]*/]*Plugin Name:' "$f" 2>/dev/null || continue
+            mainfile="$f"; break
+        done
+        [ -n "$mainfile" ] || continue
+
+        line="$(grep -iE '^[[:space:]*/]*Plugin Name:' "$mainfile" | head -1)"
+        name="$(printf '%s' "${line#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        line="$(grep -iE '^[[:space:]*/]*Text Domain:' "$mainfile" | head -1)"
+        textdomain="$(printf '%s' "${line#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        line="$(grep -iE '^[[:space:]*/]*Author:' "$mainfile" | head -1)"
+        author="$(printf '%s' "${line#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+        hits=0; detail=""
+
+        if [ -n "$textdomain" ]; then
+            if printf '%s' "$textdomain" | grep -qE '\-[0-9a-f]{4,8}$'; then
+                hits=$((hits+1)); detail="${detail}Text Domain '$textdomain' has a random-hex suffix; "
+            fi
+            if [ -n "$name" ]; then
+                local namenorm tdnorm
+                namenorm="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')"
+                tdnorm="$(printf '%s' "$textdomain" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')"
+                if [ -n "$namenorm" ] && [ -n "$tdnorm" ]; then
+                    case "$namenorm" in
+                        *"$tdnorm"*) : ;;
+                        *) case "$tdnorm" in
+                               *"$namenorm"*) : ;;
+                               *) hits=$((hits+1))
+                                  detail="${detail}Text Domain '$textdomain' doesn't resemble Plugin Name '$name'; " ;;
+                           esac ;;
+                    esac
+                fi
+            fi
+        fi
+
+        if [ -n "$author" ]; then
+            case "$author" in
+                "WordPress.org Community"|"WordPress"|"Automattic")
+                    case "$known_automattic" in
+                        *"|$slug|"*) : ;;
+                        *) hits=$((hits+1))
+                           detail="${detail}Author claims '$author' but '$slug' isn't a known Automattic/core plugin; " ;;
+                    esac ;;
+            esac
+        fi
+
+        [ "$hits" -gt 0 ] || continue
+        local sev="MED"; [ "$hits" -ge 2 ] && sev="HIGH"
+        report "$sev" "plugin-header-mismatch" "wp-content/plugins/$slug" "${detail% }"
     done
 }
 
@@ -758,8 +851,11 @@ rule RS_eval_user_input {
         description = "eval/assert of user-controlled input"
         severity = "HIGH"
     strings:
-        $a = /(eval|assert)\s*\(\s*(stripslashes\s*\()?\s*\$_(POST|GET|REQUEST|COOKIE)/ nocase
-        $b = /(eval|assert)\s*\(\s*\$[a-zA-Z_]+\s*\)/ nocase
+        // \b anchors avoid matching a plain function call like doubleval(...) or
+        // retrieval(...), both of which contain "eval(" as a bare substring -
+        // confirmed against a clean Gravity Forms copy, see VERIFY.md
+        $a = /\b(eval|assert)\s*\(\s*(stripslashes\s*\()?\s*\$_(POST|GET|REQUEST|COOKIE)/ nocase
+        $b = /\b(eval|assert)\s*\(\s*\$[a-zA-Z_]+\s*\)/ nocase
     condition:
         any of them
 }
@@ -879,13 +975,14 @@ rule RS_command_exec_fallback_chain {
 
 rule RS_hardcoded_secret_gated_exec {
     meta:
-        description = "Hardcoded-secret gated command-exec backdoor (hash_equals against fixed value then runs request-derived command)"
+        description = "Hardcoded-secret gated command-exec backdoor (hash_equals against fixed value then runs request-derived command), or the same hash_equals gate paired with a disable_functions= probe as a bonus tell"
         severity = "HIGH"
     strings:
         $h = /hash_equals\s*\(\s*["'][^"']{6,}["']\s*,\s*\$_(GET|POST|REQUEST|SERVER)/ nocase
         $e = /(system|passthru|shell_exec|exec|popen|proc_open)\s*\(\s*\$_(GET|POST|REQUEST)/ nocase
+        $df = "disable_functions=" nocase
     condition:
-        $h and $e
+        ($h and $e) or ($h and $df)
 }
 
 rule RS_globals_flood_backdoor {
@@ -1139,6 +1236,84 @@ rule RS_xss_hidden_admin_backdoor {
     condition:
         $comment
 }
+
+rule RS_rankmath_pro_supplychain_oct2026 {
+    meta:
+        description = "Rank Math SEO PRO supply-chain compromise (Oct 2026, CVE-2026-111862): backdoored packages of PRO 3.0.123 contain a C2 domain, randomized option/key markers and a disguised cron tag - matches on any one published IOC in a PHP file"
+        severity = "HIGH"
+    strings:
+        $php = "<?php"
+        $i1 = "rank1cdn.com"
+        $i2 = "xmmqhn"
+        $i3 = "_uf6qdn2hmm"
+        $i4 = "t8krdk990phb"
+        $i5 = "_np5pvf754c"
+        $i6 = "#ms6v46"
+        $i7 = "@wp-mail.net"
+    condition:
+        $php and 1 of ($i*)
+}
+
+rule RS_updraftcentral_variant2_oct2026_backdoor {
+    meta:
+        description = "UpdraftCentral key-compromise backdoor, second variant (Oct 2026 campaign): hides its planted editor account from the admin-list query/count (pre_user_query + pre_count_users) in addition to the hash_equals-gated wp_set_auth_cookie takeover"
+        severity = "HIGH"
+    strings:
+        $d1 = "keep service accounts out of the main user list"
+        $d2 = "Improves cron tasks efficiency for content sites with minimal overhead"
+        $hook1 = "pre_user_query"
+        $hook2 = "pre_count_users"
+        $c = "wp_set_auth_cookie"
+        $h = "hash_equals"
+    condition:
+        $d1 or $d2 or ($hook1 and $hook2 and $c and $h)
+}
+
+rule RS_option_js_injector_wp_head {
+    meta:
+        description = "wp_head-hooked PHP that echoes a <script> block built from a get_option() value and an obfuscated-call marker ([].constructor.constructor(atob( or Function(atob(), without the current_user_can('manage_options') gate a legitimate admin-notice script would have"
+        severity = "HIGH"
+    strings:
+        $hook = /add_action\s*\(\s*['"]wp_head['"]/ nocase
+        $script = "<script" nocase
+        $opt = /get_option\s*\(/ nocase
+        $cap = /current_user_can\s*\(\s*['"]manage_options['"]/ nocase
+        $m1 = "[].constructor.constructor(atob("
+        $m2 = "Function(atob("
+    condition:
+        $hook and $script and $opt and ($m1 or $m2) and not $cap
+}
+
+rule RS_rest_backdoor_keyed_open_route {
+    meta:
+        description = "Unauthenticated REST backdoor: register_rest_route() with permission_callback '__return_true', a GET-param key compared to a hardcoded literal, gating update_option/delete_option or WP_Filesystem->delete"
+        severity = "HIGH"
+    strings:
+        $route = /register_rest_route\s*\(/ nocase
+        $perm  = /permission_callback['"]?\s*=>\s*['"]__return_true['"]/ nocase
+        $key   = /get_param\s*\(\s*['"]key['"]\s*\)/ nocase
+        $cmp   = /(==|===)\s*['"][A-Za-z0-9_\-]{6,}['"]/
+        $opt1  = /update_option\s*\(/ nocase
+        $opt2  = /delete_option\s*\(/ nocase
+        $fsdel = /WP_Filesystem[^;]{0,60}->\s*delete\s*\(/ nocase
+    condition:
+        $route and $perm and $key and $cmp and ($opt1 or $opt2 or $fsdel)
+}
+
+rule RS_split_string_include {
+    meta:
+        description = "include/require of a filename reassembled from 2+ concatenated string fragments (e.g. __DIR__ . \"x\" . \"y.ph\" . \"p\") - evades static .php-extension grep; no legitimate reason to split a short filename like this"
+        severity = "HIGH"
+    strings:
+        // {0,80} not {0,80}?: yara-x and classic yara both reject mixing
+        // greedy and non-greedy quantifiers in one regex (E015 / "greedy
+        // and ungreedy quantifiers can't be mixed"). A bounded quantifier
+        // backtracks to the same match/no-match result either way, so this
+        // doesn't change which files the rule fires on.
+        $a = /\b(include|require|require_once|include_once)\s*\([^;{}]{0,80}['"][^'"]{0,40}['"]\s*\.\s*['"][^'"]{0,40}['"]\s*\.\s*['"][^'"]{0,40}['"]/ nocase
+    condition:
+        $a
+}
 RSYARA
 }
 
@@ -1221,8 +1396,11 @@ scan_yara() {
                 # inside a trusted-looking vendor path (e.g. a host's own mu-plugins
                 # folder) is exactly the scenario ALLOWPATH must not hide. Force HIGH
                 # back for any rule with "backdoor" in its name, undoing the downgrade
-                # above. (Covers future backdoor-named rules automatically.)
-                case "$rule" in *backdoor*) sev="HIGH";; esac
+                # above (covers future backdoor-named rules automatically), plus named
+                # exceptions for backdoor-class rules whose name doesn't say so.
+                case "$rule" in
+                    *backdoor*|RS_rankmath_pro_supplychain_oct2026) sev="HIGH";;
+                esac
                 # A few rules (eval/pack) legitimately fire inside well-known vendored
                 # libraries that USE eval/pack by design (dompdf's template engine, the
                 # portable-utf8 encoder, Less/SCSS compilers, apimatic). Downgrade ONLY
@@ -1361,6 +1539,239 @@ scan_updraftcentral_notice() {
     notice "  See https://patchstack.com/articles/updraftcentral-key-compromise-wordpress-backdoors/"
 }
 
+scan_updraftcentral_variant2_grep_fallback() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        if grep -qF "keep service accounts out of the main user list" "$f" 2>/dev/null \
+           || grep -qF "Improves cron tasks efficiency for content sites with minimal overhead" "$f" 2>/dev/null; then
+            report "HIGH" "yara:RS_updraftcentral_variant2_oct2026_backdoor" "$rel" \
+                "matched YARA rule RS_updraftcentral_variant2_oct2026_backdoor"
+        elif grep -qF "pre_user_query" "$f" 2>/dev/null \
+             && grep -qF "pre_count_users" "$f" 2>/dev/null \
+             && grep -qF "wp_set_auth_cookie" "$f" 2>/dev/null \
+             && grep -qF "hash_equals" "$f" 2>/dev/null; then
+            report "HIGH" "yara:RS_updraftcentral_variant2_oct2026_backdoor" "$rel" \
+                "matched YARA rule RS_updraftcentral_variant2_oct2026_backdoor"
+        fi
+    done < "$PHPLIST"
+}
+
+# scan_updraftcentral_variant2_indicators: read-only extras from Patchstack's
+# write-up - a plugin that declares itself "Site Health Cache", and two named
+# backdoor accounts / the shared display name "Site Tools". Changes nothing.
+scan_updraftcentral_variant2_indicators() {
+    local plugdir f P="${DBPREFIX:-wp_}"
+    for plugdir in "$WPROOT"/wp-content/plugins/*/; do
+        [ -d "$plugdir" ] || continue
+        for f in "$plugdir"*.php; do
+            [ -f "$f" ] || continue
+            if grep -qiE '^[[:space:]*/]*Plugin Name:[[:space:]]*Site Health Cache[[:space:]]*$' "$f" 2>/dev/null; then
+                report "HIGH" "updraftcentral-supplychain-artifact" "${f#"$WPROOT"/}" \
+                    "plugin declares itself 'Site Health Cache', a published UpdraftCentral key-compromise indicator (Oct 2026) - verify and remove"
+            fi
+        done
+    done
+
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    db_query "SELECT ID, user_login, display_name FROM ${P}users
+              WHERE user_login IN ('data-ops43','media-staff96') OR display_name='Site Tools';" \
+    | while IFS=$'\t' read -r id login disp; do
+        [ -n "$id" ] || continue
+        report "HIGH" "updraftcentral-supplychain-artifact" "user:$id" \
+            "'$login' (display name '$disp') matches a published UpdraftCentral key-compromise account indicator (Oct 2026) - verify and remove"
+    done
+}
+
+# ======================= RANK MATH PRO SUPPLY-CHAIN (Oct 2026) ================
+# CVE-2026-111862: backdoored packages of Rank Math SEO PRO 3.0.123. See the
+# VULNPLUGIN entry (ratsweepr-sigs.conf) for the version check, and
+# RS_rankmath_pro_supplychain_oct2026 (ratsweepr.yar) for the IOC-string rule.
+# These are the parts a version check and a content-string rule can't cover:
+# the exact fake core-file path, a .htaccess/.cache execution trick, and
+# read-only DB/crontab extras. Nothing here is php-gated - all pure bash.
+
+scan_rankmath_grep_fallback() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -qF '<?php' "$f" 2>/dev/null || continue
+        if grep -qF "rank1cdn.com" "$f" 2>/dev/null \
+           || grep -qF "xmmqhn" "$f" 2>/dev/null \
+           || grep -qF "_uf6qdn2hmm" "$f" 2>/dev/null \
+           || grep -qF "t8krdk990phb" "$f" 2>/dev/null \
+           || grep -qF "_np5pvf754c" "$f" 2>/dev/null \
+           || grep -qF "#ms6v46" "$f" 2>/dev/null \
+           || grep -qF "@wp-mail.net" "$f" 2>/dev/null; then
+            report "HIGH" "yara:RS_rankmath_pro_supplychain_oct2026" "$rel" \
+                "matched YARA rule RS_rankmath_pro_supplychain_oct2026"
+        fi
+    done < "$PHPLIST"
+}
+
+# scan_rankmath_fake_core_file: wp-includes/class-wp-cache-util.php is never a
+# real WordPress core file at any version - wordpress.org's official checksum
+# manifest never lists it. (scan_core_checksums's generic manifest-diff would
+# also catch this as core-unknown-file, but only when php-cli is present; this
+# named, pure-bash check catches it unconditionally.)
+scan_rankmath_fake_core_file() {
+    [ -f "$WPROOT/wp-includes/class-wp-cache-util.php" ] || return
+    report "HIGH" "rankmath-fake-core-file" "wp-includes/class-wp-cache-util.php" \
+        "not a real WordPress core file at any version - the Rank Math PRO supply-chain compromise (Oct 2026) drops this exact path"
+}
+
+# scan_cache_php_files: a .cache file should be inert cached data, never PHP.
+scan_cache_php_files() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        if head -c 64 "$f" 2>/dev/null | grep -qE '^[[:space:]]*<\?php'; then
+            report "HIGH" "cache-file-php" "$rel" \
+                "a .cache file whose content starts with a PHP open tag - not a real cache artifact (Rank Math PRO supply-chain pattern, Oct 2026)"
+        fi
+    done < <(find "$WPROOT" -type f -name '*.cache' -print0 2>/dev/null)
+}
+
+# ===================== real-site follow-up detections (Oct 2026) =============
+# The next several checks were built from a real infected site's findings (no
+# names/domains/IPs/samples committed - only the technique). Three of the new
+# YARA rules below use 2+ " and "s or a "not" in their condition, which trips
+# native_yara()'s skip-regex exactly like the UpdraftCentral/Rank Math rules
+# did - each gets a dedicated always-run grep fallback for the same reason.
+
+# scan_option_js_injector_grep_fallback: explicit grep-equivalent of
+# RS_option_js_injector_wp_head (skipped by native_yara - "not" in its condition).
+scan_option_js_injector_grep_fallback() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -qE "add_action\s*\(\s*['\"]wp_head['\"]" "$f" 2>/dev/null || continue
+        grep -qF '<script' "$f" 2>/dev/null || continue
+        grep -qE "get_option\s*\(" "$f" 2>/dev/null || continue
+        { grep -qF '[].constructor.constructor(atob(' "$f" 2>/dev/null \
+          || grep -qF 'Function(atob(' "$f" 2>/dev/null; } || continue
+        grep -qE "current_user_can\s*\(\s*['\"]manage_options['\"]" "$f" 2>/dev/null && continue
+        report "HIGH" "yara:RS_option_js_injector_wp_head" "$rel" \
+            "matched YARA rule RS_option_js_injector_wp_head"
+    done < "$PHPLIST"
+}
+
+# scan_rest_backdoor_grep_fallback: explicit grep-equivalent of
+# RS_rest_backdoor_keyed_open_route (skipped by native_yara - 4 " and "s).
+scan_rest_backdoor_grep_fallback() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -qE "register_rest_route\s*\(" "$f" 2>/dev/null || continue
+        grep -qE "permission_callback['\"]?\s*=>\s*['\"]__return_true['\"]" "$f" 2>/dev/null || continue
+        grep -qE "get_param\s*\(\s*['\"]key['\"]\s*\)" "$f" 2>/dev/null || continue
+        grep -qE "(==|===)\s*['\"][A-Za-z0-9_-]{6,}['\"]" "$f" 2>/dev/null || continue
+        { grep -qE "update_option\s*\(" "$f" 2>/dev/null \
+          || grep -qE "delete_option\s*\(" "$f" 2>/dev/null \
+          || grep -qE "WP_Filesystem[^;]{0,60}->\s*delete\s*\(" "$f" 2>/dev/null; } || continue
+        report "HIGH" "yara:RS_rest_backdoor_keyed_open_route" "$rel" \
+            "matched YARA rule RS_rest_backdoor_keyed_open_route"
+    done < "$PHPLIST"
+}
+
+# scan_secret_gated_exec_grep_fallback: explicit grep-equivalent of (the now
+# extended) RS_hardcoded_secret_gated_exec. The condition is written as
+# "($h and $e) or ($h and $df)" - logically $h and ($e or $df), but phrased
+# with two " and "s on purpose so it trips native_yara()'s skip-regex. Without
+# that, native_yara's fallback logic (which only understands "all of them" vs
+# "any of them") would mis-evaluate the un-skipped form as "any of them" and
+# fire on $h ALONE - and hash_equals alone, with no exec/disable_functions=
+# nearby, is a completely normal CSRF/webhook-signature pattern. Confirmed via
+# a synthetic hash_equals-only control fixture that first reproduced exactly
+# this false positive before the condition was rephrased - see VERIFY.md.
+scan_secret_gated_exec_grep_fallback() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -qE 'hash_equals\s*\(\s*"[^"]{6,}"\s*,\s*\$_(GET|POST|REQUEST|SERVER)' "$f" 2>/dev/null \
+            || grep -qE "hash_equals\s*\(\s*'[^']{6,}'\s*,\s*\\\$_(GET|POST|REQUEST|SERVER)" "$f" 2>/dev/null \
+            || continue
+        { grep -qE 'exec\s*\(\s*\$_(GET|POST|REQUEST)' "$f" 2>/dev/null \
+          || grep -qE 'system\s*\(\s*\$_(GET|POST|REQUEST)' "$f" 2>/dev/null \
+          || grep -qE 'passthru\s*\(\s*\$_(GET|POST|REQUEST)' "$f" 2>/dev/null \
+          || grep -qE 'shell_exec\s*\(\s*\$_(GET|POST|REQUEST)' "$f" 2>/dev/null \
+          || grep -qE 'popen\s*\(\s*\$_(GET|POST|REQUEST)' "$f" 2>/dev/null \
+          || grep -qE 'proc_open\s*\(\s*\$_(GET|POST|REQUEST)' "$f" 2>/dev/null \
+          || grep -qF 'disable_functions=' "$f" 2>/dev/null; } || continue
+        report "HIGH" "yara:RS_hardcoded_secret_gated_exec" "$rel" \
+            "matched YARA rule RS_hardcoded_secret_gated_exec"
+    done < "$PHPLIST"
+}
+
+# scan_blockchain_js_loader: a long (>2KB) base64 string constant that DECODES
+# to JS calling eth_call against an RPC endpoint (sepolia/rpc/tenderly/
+# publicnode style) plus crypto.subtle or localStorage caching - a
+# blockchain-hosted malware loader/wallet-drainer. The decode step is what
+# makes this a dedicated function rather than a YARA rule: matching the
+# base64 TEXT directly would need 3 phase-shifted variants per IOC (alignment-
+# dependent) and still couldn't require ALL of eth_call+RPC+cache together
+# without a real decode. Pure bash (base64/openssl), no php needed.
+scan_blockchain_js_loader() {
+    have base64 || have openssl || return
+    # ~2KB decoded (~2730 base64 chars). Written as 27 chained {100} groups
+    # instead of one {2730,} interval - BSD/macOS grep's regex engine caps a
+    # single {m,n} repetition count at 255 and errors ("maximum repetition
+    # exceeds 255") on anything larger; chaining keeps every individual count
+    # under that limit while still requiring the same total run length.
+    local longrun='([A-Za-z0-9+/]{100}){27,}[A-Za-z0-9+/]*={0,2}'
+    local f rel candidate decoded n
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        # cheap pre-filter: only decode files that actually contain a run this long
+        grep -qE "$longrun" "$f" 2>/dev/null || continue
+        n=0
+        while IFS= read -r candidate && [ "$n" -lt 5 ]; do
+            n=$((n+1))
+            decoded="$(printf '%s' "$candidate" | { base64 -d 2>/dev/null || openssl base64 -d -A 2>/dev/null; })"
+            [ -n "$decoded" ] || continue
+            if printf '%s' "$decoded" | grep -qF "eth_call" \
+               && printf '%s' "$decoded" | grep -qiE '(sepolia|/rpc|tenderly|publicnode)' \
+               && { printf '%s' "$decoded" | grep -qF "crypto.subtle" \
+                    || printf '%s' "$decoded" | grep -qF "localStorage"; }; then
+                report "HIGH" "blockchain-js-loader" "$rel" \
+                    "a >2KB base64 constant decodes to JS calling eth_call against an RPC endpoint (sepolia/rpc/tenderly/publicnode) plus crypto.subtle/localStorage - blockchain-hosted malware loader"
+                break
+            fi
+        done < <(grep -oE "$longrun" "$f" 2>/dev/null)
+    done < "$PHPLIST"
+}
+
+# scan_rankmath_readonly_indicators: published IOCs a file/content rule can't
+# see - a crontab tag and three option names/account pattern. Report-only.
+scan_rankmath_readonly_indicators() {
+    local P="${DBPREFIX:-wp_}"
+    if crontab -l 2>/dev/null | grep -qF '#ms6v46'; then
+        report "HIGH" "rankmath-supplychain-artifact" "crontab" \
+            "a crontab entry tagged #ms6v46 - the Rank Math PRO supply-chain cron marker (Oct 2026); review with: crontab -l"
+    fi
+
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    db_query "SELECT option_name FROM ${P}options WHERE option_name IN ('_uf6qdn2hmm','t8krdk990phb','_np5pvf754c');" \
+    | while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        report "HIGH" "rankmath-supplychain-artifact" "option:$name" \
+            "matches a published Rank Math PRO supply-chain option name (Oct 2026) - remove it"
+    done
+    db_query "SELECT ID, user_login, user_email FROM ${P}users
+              WHERE user_login LIKE 'wpsupport\\_%' OR user_email LIKE '%@wp-mail.net';" \
+    | while IFS=$'\t' read -r id login email; do
+        [ -n "$id" ] || continue
+        report "HIGH" "rankmath-supplychain-artifact" "user:$id" \
+            "'$login' <$email> matches a published Rank Math PRO supply-chain account pattern (Oct 2026) - verify and remove"
+    done
+}
+
 # scan_xss_hidden_admin_paths: exact backdoor filenames/paths from the Oct
 # 2026 plugin-XSS-chain campaign (Ninja Forms / WPC Product Bundles stored
 # XSS -> hidden admin via mu-plugins). Pure filesystem checks, no php
@@ -1495,8 +1906,15 @@ scan_vulnerable_plugins() {
         fi
         local sev="MED" extxt=""
         if [ "$exploited" = "yes" ]; then sev="HIGH"; extxt=" - actively exploited"; fi
-        report "$sev" "vulnerable-plugin" "wp-content/plugins/$slug ($ver)" \
-            "outdated/vulnerable: $cve, fixed in $applicable_fixed$extxt - see $url"
+        if [ -n "$exactver" ] && [ "$ver" = "$exactver" ] && [ -n "$exactnote" ]; then
+            # Still vulnerable (not fixed) AND exactly the version EXACT= names:
+            # use its own custom wording instead of the generic template (e.g.
+            # a specific compromised build, not just "outdated"), same severity.
+            report "$sev" "vulnerable-plugin" "wp-content/plugins/$slug ($ver)" "$exactnote"
+        else
+            report "$sev" "vulnerable-plugin" "wp-content/plugins/$slug ($ver)" \
+                "outdated/vulnerable: $cve, fixed in $applicable_fixed$extxt - see $url"
+        fi
     done < "$PATTERNS_FILE"
 }
 
@@ -1514,6 +1932,13 @@ scan_heuristics() {
                 grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
                 if allowpath_check "$rel"; then
                     report "INFO" "heuristic:$name" "$rel" "matched '$name' in trusted vendor path (managed-host mu-plugins et al) - expected"
+                elif [ "$name" = "sslverify_disabled" ] && case "$rel" in
+                         */js_composer/*local-fonts*) true;; *) false;; esac; then
+                    # Confirmed against a clean WPBakery (js_composer) copy: its own
+                    # class-local-fonts.php legitimately disables SSL verification
+                    # when downloading Google Font binaries (works around shared-host
+                    # CA-bundle issues). See VERIFY.md.
+                    report "INFO" "heuristic:$name" "$rel" "matched '$name' in WPBakery's own local-fonts downloader - known-benign vendor behavior"
                 else
                     report "$basesev" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW"
                 fi
@@ -1647,6 +2072,14 @@ scan_htaccess() {
         if grep -qIE 'base64|AddHandler|AddType[[:space:]]+application/x-httpd-php|auto_(ap|pre)pend_file|RewriteRule[^#]*(\.ru|\.cn|\.top)/' "$f" 2>/dev/null; then
             report "MED" "htaccess-suspicious" "${f#"$WPROOT"/}" "contains handler/append/base64/redirect directives - REVIEW"
         fi
+        # .cache mapped to a PHP handler: zero legitimate use, a Rank Math PRO
+        # supply-chain pattern (Oct 2026) for running the .cache files it drops.
+        if grep -qiE '\.cache' "$f" 2>/dev/null \
+           && grep -qiE 'AddHandler|AddType|SetHandler' "$f" 2>/dev/null \
+           && grep -qi 'php' "$f" 2>/dev/null; then
+            report "HIGH" "htaccess-cache-php-handler" "${f#"$WPROOT"/}" \
+                "maps .cache files to a PHP handler (AddHandler/AddType/SetHandler + .cache + php) - Rank Math PRO supply-chain pattern (Oct 2026); review and remove"
+        fi
         case "$f" in
             "$WPROOT/wp-content/uploads/"*)
                 grep -qIE 'php_flag[[:space:]]+engine[[:space:]]+off|Deny from all|Require all denied' "$f" 2>/dev/null \
@@ -1658,13 +2091,24 @@ scan_htaccess() {
 
 # ------------------------------ database scan --------------------------------
 wpconfig_val() { # extract define('KEY','val') from wp-config.php without executing it
-    grep -E "define\(\s*['\"]$1['\"]" "$WPROOT/wp-config.php" \
-        | head -1 | sed -E "s/.*define\(\s*['\"]$1['\"]\s*,\s*['\"]([^'\"]*)['\"].*/\1/"
+    # [[:space:]] not \s: BSD/macOS sed's -E does not support the \s shorthand
+    # (silently fails to match, so s/// becomes a no-op and the WHOLE line
+    # passes through unchanged) - confirmed against real /usr/bin/sed, see
+    # VERIFY.md. grep's \s is fine (GNU and BSD grep both support it); this
+    # is a sed-specific gap.
+    grep -E "define\([[:space:]]*['\"]$1['\"]" "$WPROOT/wp-config.php" \
+        | head -1 | sed -E "s/.*define\([[:space:]]*['\"]$1['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/"
 }
 
 db_query() { # db_query "SQL"  -> tab-separated rows on stdout
+    # PHP's CLI SAPI sends E_DEPRECATED/E_WARNING/E_NOTICE text to STDOUT (not
+    # stderr) by default, so a mismatched wp-cli.phar/PHP version pair - exactly
+    # the kind of drift shared hosting has - can inject a "Deprecated: ..." line
+    # into otherwise-clean query output. Strip that class of noise so callers
+    # never have to guess whether a row is real data.
     if [ -n "$WPCLI" ]; then
-        $WPCLI db query "$1" --skip-column-names 2>/dev/null
+        $WPCLI db query "$1" --skip-column-names 2>/dev/null \
+            | grep -vE '^(PHP )?(Deprecated|Warning|Notice|Fatal error):|^$'
     elif [ "$HAVE_MYSQL" = "1" ]; then
         local host="${DB_HOST%%:*}" port=""
         case "$DB_HOST" in *:*) port="${DB_HOST##*:}";; esac
@@ -1679,7 +2123,7 @@ scan_database() {
     DB_PASSWORD="$(wpconfig_val DB_PASSWORD)"; DB_HOST="$(wpconfig_val DB_HOST)"
     local P
     P="$(grep -E '^\s*\$table_prefix' "$WPROOT/wp-config.php" \
-         | sed -E "s/.*=\s*['\"]([^'\"]+)['\"].*/\1/" | head -1)"
+         | sed -E "s/.*=[[:space:]]*['\"]([^'\"]+)['\"].*/\1/" | head -1)"
     P="${P:-wp_}"
     DBPREFIX="$P"
     if [ -z "$WPCLI" ] && [ "$HAVE_MYSQL" != "1" ]; then
@@ -1699,6 +2143,7 @@ scan_database() {
               WHERE post_status='publish'
                 AND post_content REGEXP '<script[^>]*src=|eval\\\\(|String\\\\.fromCharCode|base64_decode|<iframe'
               LIMIT 200;" | while IFS=$'\t' read -r id ptype pmod; do
+        [ -n "$id" ] || continue
         report "MED" "db-post-injection" "post:$id" "$ptype modified $pmod contains script/eval/iframe patterns - REVIEW (use revisions to restore)"
     done
 
@@ -1724,6 +2169,7 @@ scan_database() {
               WHERE (option_name LIKE 'widget_%' OR option_name LIKE 'theme_mods_%')
                 AND option_value REGEXP '<script|eval\\\\(|base64_decode' LIMIT 50;" \
     | while IFS= read -r name; do
+        [ -n "$name" ] || continue
         report "MED" "db-option-injection" "option:$name" "widget/theme option contains script/eval - REVIEW in wp-admin"
     done
     db_query "SELECT option_name, LENGTH(option_value) FROM ${P}options
@@ -1773,6 +2219,159 @@ scan_database() {
         report "MED" "db-cron" "option:cron" "cron option contains eval/base64/odd URLs - inspect with: wp cron event list"
     fi
     ok "Database scan done."
+}
+
+# scan_malicious_options: wp_options rows holding attacker payload data - either
+# a long, pure-base64-charset value that decodes to JS malware (Function()/
+# eval()/atob()), or a row whose option_name was the one read by a confirmed
+# RS_option_js_injector_wp_head match (that injector pulls its payload FROM an
+# option; this finds which one). Detection-only (free): no cleanup action -
+# the paid Cleanup Kit exports then deletes these rows via quarantine-db.
+scan_malicious_options() {
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+
+    if have base64 || have openssl; then
+        db_query "SELECT option_name, option_value FROM ${P}options
+                  WHERE LENGTH(option_value) > 200
+                    AND option_value REGEXP '^[A-Za-z0-9+/=[:space:]]+\$'
+                  LIMIT 500;" \
+        | while IFS=$'\t' read -r name val; do
+            [ -n "$name" ] && [ -n "$val" ] || continue
+            local decoded
+            decoded="$(printf '%s' "$val" | tr -d '[:space:]' | { base64 -d 2>/dev/null || openssl base64 -d -A 2>/dev/null; })"
+            [ -n "$decoded" ] || continue
+            if printf '%s' "$decoded" | grep -qE 'Function[[:space:]]*\(|\beval[[:space:]]*\(|atob[[:space:]]*\('; then
+                report "HIGH" "db-malicious-option" "option:$name" \
+                    "option value is a base64 blob decoding to JS containing Function()/eval()/atob() - attacker payload"
+            fi
+        done
+    fi
+
+    # cross-reference: option name(s) read by a confirmed wp_head JS-injector match
+    grep -F $'\tyara:RS_option_js_injector_wp_head\t' "$REPORT" 2>/dev/null | cut -f3 | sort -u \
+    | while IFS= read -r rel; do
+        [ -n "$rel" ] && [ -f "$WPROOT/$rel" ] || continue
+        grep -oE "get_option\s*\([[:space:]]*['\"][A-Za-z0-9_-]+['\"]" "$WPROOT/$rel" 2>/dev/null \
+        | sed -E "s/.*['\"]([A-Za-z0-9_-]+)['\"].*/\1/" | sort -u \
+        | while IFS= read -r optname; do
+            [ -n "$optname" ] || continue
+            db_query "SELECT option_name FROM ${P}options WHERE option_name='$optname';" \
+            | while IFS= read -r foundname; do
+                [ -n "$foundname" ] || continue
+                report "HIGH" "db-malicious-option" "option:$foundname" \
+                    "option is read by the wp_head JS-injector match in $rel (RS_option_js_injector_wp_head) - its payload source"
+            done
+        done
+    done
+}
+
+# scan_admin_exploit_correlation: WordPress's own customize_changeset timestamps
+# are an exploit's unintentional audit trail - a planted admin account is
+# typically created in the SAME request that drops a changeset/nav-menu-item PoC
+# artifact, so their timestamps line up to the second. Neither check here is
+# limited by EXPLOIT_WINDOW_START/SINCE_DATE - a correlated hit matters
+# regardless of the general disclosure-date guess, and whenever either fires
+# the earliest changeset date is reported as the likely real compromise date
+# instead of whatever window the rest of the scan assumed.
+scan_admin_exploit_correlation() {
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    local fired89=0
+
+    # 9) wp2shell/PoC sentinel pattern - grouped into ONE finding, not one per row.
+    local poc_ids
+    poc_ids="$(db_query "SELECT GROUP_CONCAT(DISTINCT ID) FROM (
+        SELECT ID FROM ${P}posts WHERE post_type='customize_changeset' AND post_date='2020-01-01 00:00:00'
+        UNION
+        SELECT p.ID FROM ${P}posts p JOIN ${P}postmeta pm ON pm.post_id=p.ID
+          WHERE p.post_type='nav_menu_item' AND pm.meta_key='_menu_item_url' AND pm.meta_value LIKE '%example.invalid%'
+        UNION
+        SELECT ID FROM ${P}posts WHERE post_type='nav_menu_item' AND post_title IN ('proof','generated')
+        UNION
+        SELECT ID FROM ${P}posts WHERE post_type='request' AND post_title='parse'
+    ) x;")"
+    if [ -n "$poc_ids" ] && [ "$poc_ids" != "NULL" ]; then
+        fired89=1
+        report "HIGH" "compromise:CHANGESET_POC_PATTERN" "posts:$poc_ids" \
+            "post(s) match the wp2shell changeset/nav_menu_item/request PoC sentinel pattern (2020-01-01 changeset date, example.invalid/proof/generated markers, request-type 'parse') - grouped as one finding"
+    fi
+
+    # 8) admin accounts created within 60s of a customize_changeset modification -
+    #    the "backdoor admin planted in the same request as a PoC" fingerprint.
+    local prev_id=""
+    while IFS=$'\t' read -r aid login email reg diffsec; do
+        [ -n "$aid" ] || continue
+        case "$aid" in ''|*[!0-9]*) continue;; esac
+        fired89=1
+        report "HIGH" "compromise:ADMIN_CREATED_BY_EXPLOIT" "user:$aid" \
+            "login=$login email=$email registered=$reg is ${diffsec}s from a customize_changeset modification - admin created by exploit"
+        # 11) ID gap vs the previous correlated administrator, INFO.
+        if [ -n "$prev_id" ]; then
+            report "INFO" "compromise:ADMIN_ID_GAP" "user:$aid" \
+                "gap=$((aid - prev_id)) since the previous flagged administrator ID ($prev_id)"
+        fi
+        prev_id="$aid"
+    done < <(db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered,
+                   ABS(TIMESTAMPDIFF(SECOND, u.user_registered, c.post_modified))
+            FROM ${P}users u
+            JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' AND m.meta_value LIKE '%administrator%'
+            JOIN ${P}posts c ON c.post_type='customize_changeset'
+            WHERE ABS(TIMESTAMPDIFF(SECOND, u.user_registered, c.post_modified)) <= 60
+            ORDER BY u.ID;")
+
+    # 12) window never downgrades 8/9 - and when either fires, print the
+    #     earliest changeset date as the likely real compromise date.
+    if [ "$fired89" = "1" ]; then
+        local earliest
+        # trim only leading/trailing whitespace - tr -d '[:space:]' would also
+        # delete the space between the date and time halves of the value.
+        earliest="$(db_query "SELECT MIN(post_date) FROM ${P}posts WHERE post_type='customize_changeset';" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        if [ -n "$earliest" ] && [ "$earliest" != "NULL" ]; then
+            report "INFO" "compromise:LIKELY_COMPROMISE_DATE" "-" \
+                "earliest customize_changeset post_date across the site: $earliest - likely compromise date (shown regardless of the general exploit-window guess)"
+        fi
+    fi
+}
+
+# scan_admin_session_review: read-only. For administrators already flagged as
+# suspicious by another check (admin-created-by-exploit, a suspicious-looking
+# admin name/email, or a user created in the exploit window), list every
+# session_tokens IP + login time so forensics doesn't have to hand-decode the
+# serialized meta. Never destroys anything - this is detection-only (free);
+# the recommendation text points at the paid shuffle-salts workflow.
+scan_admin_session_review() {
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    local ids
+    ids="$(awk -F'\t' '$2 ~ /^compromise:(ADMIN_CREATED_BY_EXPLOIT|SUSPICIOUS_ADMIN|EVIDENCE_USER)$/ && $3 ~ /^user:/ {sub(/user:/,"",$3); print $3}' "$REPORT" 2>/dev/null | sort -un)"
+    [ -n "$ids" ] || return
+
+    local id raw
+    for id in $ids; do
+        raw="$(db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$id AND meta_key='session_tokens';")"
+        [ -n "$raw" ] || continue
+        local ip n=0
+        while IFS= read -r ip; do
+            n=$((n+1))
+            # best-effort: session_tokens serializes each entry as
+            # ip/ua/login/expiration in that fixed order, so the Nth ip pairs
+            # with the Nth login timestamp - not a strict guarantee, but WP
+            # always emits them in this order.
+            local epoch login
+            # match from "login" (not the s:5: length-prefix before it) so the
+            # extracted digits are ONLY the timestamp - s:5: would otherwise
+            # contribute a spurious leading "5" as a second grep -oE match.
+            epoch="$(printf '%s' "$raw" | grep -oE '"login";i:[0-9]+;' | sed -n "${n}p" | grep -oE '[0-9]+')"
+            login="${epoch:-unknown}"
+            if [ -n "$epoch" ]; then
+                login="$(date -r "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'epoch:%s' "$epoch")"
+            fi
+            report "MED" "admin-session" "user:$id" "session IP=$ip login=$login - review and destroy if not recognized"
+        done < <(printf '%s' "$raw" | grep -oE 's:2:"ip";s:[0-9]+:"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')
+        [ "$n" -gt 0 ] && notice "Admin user:$id has $n session(s) listed above - recommend destroying all sessions and rotating salts/passwords."
+    done
 }
 
 scan_cve_artifacts() {
@@ -1925,30 +2524,301 @@ scan_compromise_indicators() {
     fi
 }
 
-scan_vulnerabilities() {
-    [ -n "$WPSCAN_API_TOKEN" ] || return 0
-    have curl || return 0
-    info "Checking installed plugins against WPScan vulnerability API..."
-    local plugdir slug out
+# ======================= WORDFENCE INTELLIGENCE FEED ==========================
+# Optional vulnerability check against the Wordfence Intelligence V3 Scanner
+# Feed (a free key from https://www.wordfence.com/account/integrations - the
+# user brings their own, never hardcoded/shipped/logged). No key -> NOTICE and
+# the scan continues. The feed is the whole database; cached under $RS_CACHE
+# and refreshed at most once per 24h, never fetched per plugin. Parsing prefers
+# jq, falls back to php -r json_decode, else skips with a NOTICE - this check
+# itself is NOT php-gated, only its parsing path optionally uses php.
+#
+# Attribution (required by the feed's license): whenever a Wordfence record is
+# shown, the report footer reproduces that record's own copyrights field
+# (Defiant's notice + license + link) via wordfence_write_attribution(), called
+# once after finalize_report. If a CVE is displayed, a MITRE CVE notice is
+# appended too. Nothing from the feed is stripped or redistributed - it's
+# fetched and cached locally by the user with their own key.
+
+RS_WORDFENCE_CACHE="$RS_CACHE/wordfence-scanner-feed.json"
+RS_WORDFENCE_FRESH_SECS=86400
+WF_ATTRIBUTION_TEXT=""
+WF_SAW_CVE=0
+
+cache_age_secs() { # cache_age_secs FILE -> seconds since mtime, or 999999 if missing
+    local f="$1" m now
+    [ -f "$f" ] || { printf '%s' 999999; return; }
+    m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)"
+    now="$(date +%s)"
+    if [ -n "$m" ]; then printf '%s' $(( now - m )); else printf '%s' 999999; fi
+}
+
+mask_secret() { # mask_secret STRING -> first4...last4, or **** if too short to mask safely
+    local s="$1" n=${#1}
+    if [ "$n" -le 8 ]; then printf '****'; else printf '%s...%s' "${s:0:4}" "${s: -4}"; fi
+}
+
+wordfence_api_key() { # env var wins, else a WORDFENCE_API_KEY= line in $RS_HOME/config
+    local key="${WORDFENCE_API_KEY:-}"
+    if [ -z "$key" ] && [ -f "$RS_HOME/config" ]; then
+        key="$(grep -E '^WORDFENCE_API_KEY=' "$RS_HOME/config" 2>/dev/null | tail -1 | cut -d= -f2-)"
+        key="$(printf '%s' "$key" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
+    fi
+    printf '%s' "$key"
+}
+
+wordfence_feed_refresh() { # populates $RS_WORDFENCE_CACHE if a key is present; returns 1 to skip the check entirely
+    local key; key="$(wordfence_api_key)"
+    if [ -z "$key" ]; then
+        notice "No Wordfence API key configured - vulnerability-feed check skipped."
+        notice "Get a free key at https://www.wordfence.com/account/integrations and set WORDFENCE_API_KEY (env var, or a 'WORDFENCE_API_KEY=...' line in $RS_HOME/config)."
+        return 1
+    fi
+    have curl || { notice "curl is required for the Wordfence feed check - skipped."; return 1; }
+
+    local age; age="$(cache_age_secs "$RS_WORDFENCE_CACHE")"
+    if [ "$age" -lt "$RS_WORDFENCE_FRESH_SECS" ]; then
+        return 0
+    fi
+
+    local tmp="$RS_CACHE/wordfence-scanner-feed.json.$$" code
+    code="$(curl -sS -o "$tmp" -w '%{http_code}' --connect-timeout 20 --max-time 180 \
+            -H "Authorization: Bearer $key" \
+            "https://www.wordfence.com/api/intelligence/v3/vulnerabilities/scanner" 2>/dev/null)"
+    if [ "$code" = "200" ] && [ -s "$tmp" ]; then
+        mv "$tmp" "$RS_WORDFENCE_CACHE"
+        return 0
+    fi
+    rm -f "$tmp"
+    if [ "$code" = "429" ]; then
+        warn "Wordfence feed rate-limited (HTTP 429) for key $(mask_secret "$key")."
+    else
+        warn "Wordfence feed fetch failed (HTTP ${code:-?}) for key $(mask_secret "$key")."
+    fi
+    if [ -s "$RS_WORDFENCE_CACHE" ]; then
+        notice "Using cached Wordfence feed, $(( age / 3600 ))h old."
+        return 0
+    fi
+    notice "No cached Wordfence feed available - vulnerability-feed check skipped."
+    return 1
+}
+
+wordfence_range_match() { # wordfence_range_match VERSION FROM FROM_INCL TO TO_INCL
+    local version="$1" fromv="$2" frominc="$3" tov="$4" toinc="$5"
+    if [ "$fromv" != "*" ]; then
+        if [ "$frominc" = "true" ]; then
+            ver_lt_V "$version" "$fromv" && return 1
+        else
+            ver_lt_V "$fromv" "$version" || return 1
+        fi
+    fi
+    if [ "$tov" != "*" ]; then
+        if [ "$toinc" = "true" ]; then
+            ver_lt_V "$tov" "$version" && return 1
+        else
+            ver_lt_V "$version" "$tov" || return 1
+        fi
+    fi
+    return 0
+}
+
+wordfence_query_software() { # wordfence_query_software TYPE SLUG -> TSV rows: id,title,informational,refs,from,frominc,to,toinc,patchedlist
+    local type="$1" slug="$2"
+    case "$JSON_PARSER" in
+        jq)
+            jq -r --arg type "$type" --arg slug "$slug" '
+                to_entries[] | .value as $v |
+                ($v.id) as $id | ($v.title) as $title |
+                ($v.informational // false) as $info |
+                ($v.references // [] | join("|")) as $refs |
+                ($v.software // [])[] | select(.type==$type and .slug==$slug) |
+                (.patched_versions // [] | join(",")) as $patchedlist |
+                (.affected_versions // {} | to_entries[].value) |
+                [$id, $title, ($info|tostring), $refs, .from_version, (.from_inclusive|tostring), .to_version, (.to_inclusive|tostring), $patchedlist] | @tsv
+            ' "$RS_WORDFENCE_CACHE" 2>/dev/null
+            ;;
+        php)
+            WF_FEED="$RS_WORDFENCE_CACHE" WF_TYPE="$type" WF_SLUG="$slug" php -r '
+                $f=getenv("WF_FEED"); $type=getenv("WF_TYPE"); $slug=getenv("WF_SLUG");
+                $d=json_decode(file_get_contents($f),true);
+                if(!is_array($d)) exit(0);
+                foreach($d as $v){
+                    if(!is_array($v)) continue;
+                    $id=$v["id"]??""; $title=$v["title"]??"";
+                    $info=empty($v["informational"])?"false":"true";
+                    $refs=implode("|",$v["references"]??[]);
+                    foreach(($v["software"]??[]) as $sw){
+                        if(($sw["type"]??"")!==$type || ($sw["slug"]??"")!==$slug) continue;
+                        $patchedlist=implode(",",$sw["patched_versions"]??[]);
+                        foreach(($sw["affected_versions"]??[]) as $av){
+                            $row=[$id,$title,$info,$refs,
+                                  $av["from_version"]??"*",
+                                  (!empty($av["from_inclusive"]))?"true":"false",
+                                  $av["to_version"]??"*",
+                                  (!empty($av["to_inclusive"]))?"true":"false",
+                                  $patchedlist];
+                            echo implode("\t",$row)."\n";
+                        }
+                    }
+                }
+            ' 2>/dev/null
+            ;;
+    esac
+}
+
+wordfence_copyright_text() { # wordfence_copyright_text ID -> one flattened line of that record's attribution text
+    case "$JSON_PARSER" in
+        jq)
+            jq -r --arg id "$1" '
+                .[] | select(.id==$id) |
+                ( .copyrights.message // "" ) as $msg |
+                ( .copyrights // {} | to_entries | map(select(.key!="message")) |
+                  map("\(.value.notice) (\(.value.license): \(.value.license_url))") | join(" | ") ) as $c |
+                (if $msg != "" then $msg + " " else "" end) + $c
+            ' "$RS_WORDFENCE_CACHE" 2>/dev/null | head -1
+            ;;
+        php)
+            WF_FEED="$RS_WORDFENCE_CACHE" WF_ID="$1" php -r '
+                $f=getenv("WF_FEED"); $id=getenv("WF_ID");
+                $d=json_decode(file_get_contents($f),true);
+                if(!is_array($d)) exit(0);
+                foreach($d as $v){
+                    if(($v["id"]??"")!==$id) continue;
+                    $cr=$v["copyrights"]??[]; $parts=[];
+                    if(!empty($cr["message"])) $parts[]=$cr["message"];
+                    foreach($cr as $k=>$c){
+                        if($k==="message" || !is_array($c)) continue;
+                        $parts[]=($c["notice"]??"")." (".( $c["license"]??"").": ".($c["license_url"]??"").")";
+                    }
+                    echo implode(" ",$parts);
+                    break;
+                }
+            ' 2>/dev/null
+            ;;
+    esac
+}
+
+scan_wordfence_vulnerabilities() {
+    [ -n "$JSON_PARSER" ] || { notice "No jq or php-cli available - Wordfence feed check skipped."; return; }
+    wordfence_feed_refresh || return
+    [ -s "$RS_WORDFENCE_CACHE" ] || return
+
+    info "Checking installed software against the Wordfence Intelligence feed..."
+    local count=0
+
+    wordfence_check_one() { # wordfence_check_one TYPE SLUG VERSION LABEL
+        local type="$1" slug="$2" version="$3" label="$4"
+        [ -n "$version" ] || return
+        local rows; rows="$(wordfence_query_software "$type" "$slug")"
+        [ -n "$rows" ] || return
+        local id title informational refs fromv frominc tov toinc patchedlist
+        while IFS=$'\t' read -r id title informational refs fromv frominc tov toinc patchedlist; do
+            [ -n "$id" ] || continue
+            if [ "$informational" = "true" ] && [ -z "${RS_VERBOSE:-}" ]; then continue; fi
+            wordfence_range_match "$version" "$fromv" "$frominc" "$tov" "$toinc" || continue
+
+            local sev="MED" extra=""
+            if [ "$type" = "plugin" ] && awk -F'|' -v s="$slug" \
+                '$1=="VULNPLUGIN" && $2==s && $5=="yes" {f=1} END{exit !f}' "$PATTERNS_FILE" 2>/dev/null; then
+                sev="HIGH"; extra=" - actively exploited"
+            fi
+            local patchedtxt="no patch available"
+            [ -n "$patchedlist" ] && patchedtxt="patched_versions: $patchedlist"
+            local reflink="${refs%%|*}"
+            local cvenote=""
+            cvenote="$(printf '%s %s' "$id" "$title" | grep -ioE 'CVE-[0-9]{4}-[0-9]{4,}' | head -1)"
+            [ -n "$cvenote" ] && { cvenote=" ($cvenote)"; WF_SAW_CVE=1; }
+
+            report "$sev" "vulnerable-$type" "$label ($version)" \
+                "known vulnerability, update: \"$title\"$cvenote, $patchedtxt$extra - $reflink"
+            count=$((count + 1))
+            if [ -z "$WF_ATTRIBUTION_TEXT" ]; then
+                WF_ATTRIBUTION_TEXT="$(wordfence_copyright_text "$id")"
+            fi
+        done <<< "$rows"
+    }
+
+    [ -n "${WPVER:-}" ] && wordfence_check_one "core" "wordpress" "$WPVER" "WordPress core"
+
+    local plugdir slug ver
     for plugdir in "$WPROOT"/wp-content/plugins/*/; do
         [ -d "$plugdir" ] || continue
         slug="$(basename "$plugdir")"
-        out="$(curl -fsS -H "Authorization: Token token=$WPSCAN_API_TOKEN" \
-               "https://wpscan.com/api/v3/plugins/$slug" 2>/dev/null)" || continue
-        if [ "$HAVE_PHP" = "1" ] && printf '%s' "$out" | php_json '
-            foreach($d as $slug=>$info){ if(empty($info["vulnerabilities"])) continue;
-              foreach($info["vulnerabilities"] as $v)
-                echo ($v["title"]??"vulnerability")."\n"; }' >/dev/null 2>&1; then
-            printf '%s' "$out" | php_json '
-              foreach($d as $slug=>$info){ if(empty($info["vulnerabilities"])) continue;
-                foreach($info["vulnerabilities"] as $v)
-                  echo ($v["title"]??"vulnerability")."\n"; }' 2>/dev/null \
-            | while IFS= read -r t; do
-                report "INFO" "vulnerability" "wp-content/plugins/$slug" "$t"
-            done
+        ver="$(plugin_installed_version "$plugdir")"
+        wordfence_check_one "plugin" "$slug" "$ver" "wp-content/plugins/$slug"
+    done
+
+    local themedir
+    for themedir in "$WPROOT"/wp-content/themes/*/; do
+        [ -d "$themedir" ] || continue
+        slug="$(basename "$themedir")"
+        [ -f "$themedir/style.css" ] || continue
+        ver="$(grep -m1 -iE '^[[:space:]*/]*Version:' "$themedir/style.css" 2>/dev/null \
+               | grep -Eo '([0-9]+\.)+[0-9]+' | head -1)"
+        wordfence_check_one "theme" "$slug" "$ver" "wp-content/themes/$slug"
+    done
+
+    unset -f wordfence_check_one
+    ok "Wordfence feed check done ($count match(es))."
+}
+
+wordfence_write_attribution() { # called once, after finalize_report, so these lines survive dedup untouched
+    [ -n "$WF_ATTRIBUTION_TEXT" ] || return
+    report "INFO" "license-notice" "-" \
+        "Vulnerability data provided by Wordfence Intelligence. $WF_ATTRIBUTION_TEXT"
+    if [ "$WF_SAW_CVE" = "1" ]; then
+        report "INFO" "license-notice" "-" \
+            "CVE(R) is a trademark of The MITRE Corporation; CVE Record data is used/reproduced under license from MITRE (see https://cve.mitre.org/about/termsofuse.html)."
+    fi
+}
+
+# ============================ OUTDATED PLUGINS (free) ==========================
+# No key needed: compares each wordpress.org-hosted plugin's installed version
+# against the wordpress.org plugin-info API (cached 24h). Never says
+# "vulnerable" - only "outdated" - unless a feed/list entry already flagged it.
+
+wporg_latest_version() { # wporg_latest_version SLUG -> latest stable version, or empty if unknown/not on wp.org
+    local slug="$1"
+    local cache="$RS_CACHE/wporg-$slug.json"
+    if [ "$(cache_age_secs "$cache")" -ge 86400 ]; then
+        local tmp="$cache.$$"
+        if fetch "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&slug=$slug" "$tmp" 2>/dev/null \
+           && [ -s "$tmp" ]; then
+            mv "$tmp" "$cache"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+    [ -s "$cache" ] || return
+    case "$JSON_PARSER" in
+        jq)  jq -r '.version // empty' "$cache" 2>/dev/null ;;
+        php) php -r '$d=json_decode(file_get_contents($argv[1]),true); if(is_array($d) && isset($d["version"])) echo $d["version"];' "$cache" 2>/dev/null ;;
+    esac
+}
+
+scan_outdated_plugins() {
+    [ -d "$WPROOT/wp-content/plugins" ] || return
+    have curl || have wget || { notice "No curl/wget - outdated-plugin check skipped."; return; }
+    [ -n "$JSON_PARSER" ] || { notice "No jq or php-cli - outdated-plugin check skipped."; return; }
+
+    local plugdir slug ver latest
+    for plugdir in "$WPROOT"/wp-content/plugins/*/; do
+        [ -d "$plugdir" ] || continue
+        slug="$(basename "$plugdir")"
+        # already flagged as vulnerable (hand-picked list or Wordfence feed) this run? don't pile on.
+        awk -F'\t' -v s="wp-content/plugins/$slug " '$2 ~ /^vulnerable-/ && index($3, s)==1 {f=1} END{exit !f}' \
+            "$REPORT" 2>/dev/null && continue
+        ver="$(plugin_installed_version "$plugdir")"
+        [ -n "$ver" ] || continue
+        latest="$(wporg_latest_version "$slug")"
+        if [ -z "$latest" ]; then
+            report "INFO" "plugin-outdated-unknown" "wp-content/plugins/$slug ($ver)" \
+                "can't check - not found on wordpress.org (likely premium): verify with the vendor"
+        elif ver_lt_V "$ver" "$latest"; then
+            report "INFO" "plugin-outdated" "wp-content/plugins/$slug ($ver)" \
+                "Outdated: installed $ver, latest $latest. Updates often include security fixes."
         fi
     done
-    ok "Vulnerability lookup done."
 }
 
 # ============================ SCAN ORCHESTRATOR ===============================
@@ -2031,10 +2901,16 @@ run_scan() {
     scan_core_checksums
     scan_core_orphans
     scan_fake_plugins
+    scan_plugin_header_mismatch
     scan_plugin_checksums
+    scan_wordfence_vulnerabilities
     scan_vulnerable_plugins
+    scan_outdated_plugins
     scan_mu_plugins
     scan_xss_hidden_admin_paths
+    scan_rankmath_fake_core_file
+    scan_cache_php_files
+    scan_blockchain_js_loader
     scan_wpconfig_content
     scan_uploads_php
     scan_exploit_upload_paths
@@ -2042,16 +2918,26 @@ run_scan() {
     scan_yara
     scan_updraftcentral_grep_fallback
     scan_updraftcentral_notice
+    scan_updraftcentral_variant2_grep_fallback
+    scan_rankmath_grep_fallback
+    scan_option_js_injector_grep_fallback
+    scan_rest_backdoor_grep_fallback
+    scan_secret_gated_exec_grep_fallback
     scan_heuristics
     scan_nulled
     scan_external_requests
     scan_htaccess
     scan_database
+    scan_updraftcentral_variant2_indicators
+    scan_rankmath_readonly_indicators
+    scan_malicious_options
+    scan_admin_exploit_correlation
     scan_cve_artifacts
     scan_compromise_indicators
-    scan_vulnerabilities
+    scan_admin_session_review
     rm -f "$PHPLIST"
     finalize_report
+    wordfence_write_attribution
 
     # ------- summary -------
     say ""
@@ -2063,6 +2949,17 @@ run_scan() {
     say "  HIGH findings : $high   (very likely malicious / integrity failures)"
     say "  MED  findings : $med   (suspicious - review before acting)"
     say "  INFO findings : $infoc   (context for your review)"
+    say ""
+    # VERDICT: a coarse read from HIGH counts alone, not a replacement for
+    # actually reading the findings - 0 HIGH is CLEAN, 1-2 is SUSPICIOUS
+    # (worth a close look), 3+ is COMPROMISED (act on it).
+    if [ "$high" -ge 3 ]; then
+        bad "VERDICT: COMPROMISED  ($high HIGH finding(s))"
+    elif [ "$high" -ge 1 ]; then
+        warn "VERDICT: SUSPICIOUS  ($high HIGH finding(s))"
+    else
+        ok "VERDICT: CLEAN  (0 HIGH findings)"
+    fi
     say ""
     if [ "$high" -gt 0 ]; then
         say "  --- HIGH (clustered) ---"
