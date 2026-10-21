@@ -472,3 +472,48 @@ rule RS_split_string_include {
     condition:
         $a
 }
+
+rule RS_compress_zlib_stream_include {
+    meta:
+        description = "compress.zlib:// stream-wrapper paired with an include/eval/fetch call - how SEO cloakers load a gzip-compressed payload off disk without leaving plain-text PHP in the payload file itself"
+        severity = "HIGH"
+    strings:
+        $wrap = "compress.zlib://" nocase
+        $inc1 = /\b(include|include_once|require|require_once)\b/ nocase
+        $inc2 = /\beval\s*\(/ nocase
+        $inc3 = /\b(file_get_contents|readfile)\s*\(/ nocase
+    condition:
+        // Written as three ANDed pairs (logically $wrap and ($inc1 or $inc2
+        // or $inc3)) on purpose: this trips native_yara()'s skip-regex (two+
+        // "and"s), because its string-presence fallback can't distinguish
+        // "wrap AND an include/eval nearby" from "wrap alone" - and
+        // include(/require(/eval( are far too common to ever treat as an
+        // OR-fallback trigger on their own. See scan_compress_zlib_grep_fallback.
+        ($wrap and $inc1) or ($wrap and $inc2) or ($wrap and $inc3)
+}
+
+rule RS_compress_zlib_stream_bare_MED {
+    meta:
+        description = "compress.zlib:// stream wrapper referenced with no include/eval/fetch call in the same file - weaker signal (rare legitimate use exists), review manually"
+        severity = "MEDIUM"
+    strings:
+        $wrap = "compress.zlib://" nocase
+        $inc1 = /\b(include|include_once|require|require_once)\b/ nocase
+        $inc2 = /\beval\s*\(/ nocase
+        $inc3 = /\b(file_get_contents|readfile)\s*\(/ nocase
+    condition:
+        // "not" always trips native_yara()'s skip-regex; see
+        // scan_compress_zlib_grep_fallback for the unconditional equivalent.
+        $wrap and not ($inc1 or $inc2 or $inc3)
+}
+
+rule RS_cloaker_token_marker_MED {
+    meta:
+        description = "campaign-specific cloaker trigger/C2 token seen in Japanese spam-SEO loader kits - context marker only, not a standalone compromise indicator"
+        severity = "MEDIUM"
+    strings:
+        $t1 = "cf1988" nocase
+        $t2 = "ys001" nocase
+    condition:
+        any of them
+}

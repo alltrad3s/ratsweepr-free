@@ -37,7 +37,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.22-free"
+RS_VERSION="2.9.23-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -805,6 +805,73 @@ scan_uploads_php() {
     ok "Uploads scan done."
 }
 
+scan_asset_tampering() {
+    # D1/D2: SEO-cloaker payloads hidden under asset-looking names. Two
+    # independent tells on the same file set, checked in one pass:
+    #   D1 - magic bytes don't match the extension (gzip/zip payload stored
+    #        as a .png/.js/.css/etc so casual review and extension-based
+    #        tooling skip right over it)
+    #   D2 - a PHP open tag (or a strong eval+decode combo) inside a file
+    #        whose extension isn't .php/.phtml/.phar
+    # Neither is covered by build_php_filelist/scan_yara - those only ever
+    # look at PHP-shaped filenames, which is exactly the blind spot this
+    # pattern exploits.
+    info "Checking static assets for magic-byte mismatches and embedded PHP..."
+    local exts=(png gif jpg jpeg webp svg css scss sass less js mjs map woff woff2 ttf eot ico mp3 mp4 pdf)
+    local nameargs=() e
+    for e in "${exts[@]}"; do
+        [ "${#nameargs[@]}" -gt 0 ] && nameargs+=(-o)
+        nameargs+=(-iname "*.$e")
+    done
+    local f rel sz magic head
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        case "$rel" in *.gz) continue;; esac   # legitimate pre-compressed assets
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        if allowpath_check "$rel"; then continue; fi
+
+        # --- D1: first 4 bytes vs. the extension's expected magic ---
+        # `dd bs=1 count=N` + `od -An -tx1` reads/renders identically under
+        # GNU coreutils (CI/shared hosting) and BSD/macOS (Jorge's Mac) -
+        # unlike `head -c`, which some stripped-down hosts lack entirely.
+        # Streams only the head of the file; never slurps whole binaries.
+        magic="$(dd if="$f" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+        case "$magic" in
+            1f8b*)
+                report "HIGH" "gzip-masquerading-as-asset" "$rel" \
+                    "file starts with gzip magic (1f 8b) but has a static-asset extension - classic SEO-cloaker payload-storage trick";;
+            504b0304*)
+                report "MED" "zip-masquerading-as-asset" "$rel" \
+                    "file starts with zip magic (50 4b 03 04) but has a static-asset extension - review";;
+        esac
+
+        # --- D2: PHP content under a non-PHP extension ---
+        # Skip multi-MB files outright - a legitimate font/video/PDF this big
+        # is never a PHP dropper, and there's no reason to grep it whole.
+        sz="$(wc -c < "$f" 2>/dev/null || echo 0)"
+        [ "$sz" -gt 5000000 ] 2>/dev/null && continue
+        # First ~200 bytes, NUL-stripped, for the open-tag check - mirrors the
+        # mktemp-file decode pattern used elsewhere in this script rather than
+        # capturing raw (possibly binary) bytes into a variable.
+        head="$(dd if="$f" bs=1 count=200 2>/dev/null | LC_ALL=C tr -d '\000')"
+        if printf '%s' "$head" | LC_ALL=C grep -aqE '^[[:space:]]*<\?(php|=)'; then
+            report "HIGH" "php-in-nonphp-extension" "$rel" \
+                "PHP open tag at the start of a file with a non-PHP extension - almost certainly a disguised payload"
+        elif LC_ALL=C grep -aqE '<\?php|<\?=' "$f" 2>/dev/null \
+             && LC_ALL=C grep -aqiE 'eval[[:space:]]*\(' "$f" 2>/dev/null \
+             && LC_ALL=C grep -aqiE 'base64_decode|gzinflate|gzuncompress|compress\.zlib://' "$f" 2>/dev/null; then
+            # A real open tag ANYWHERE (not just the head) combined with an
+            # eval+decode combo - looser than the head-only check above, so
+            # require the stronger multi-signal combo to hold the FP rate
+            # down (ordinary minified JS/CSS can contain the bare word "eval").
+            report "HIGH" "php-in-nonphp-extension" "$rel" \
+                "PHP open tag + eval/decode combo inside a file with a non-PHP extension - review"
+        fi
+    done < <(find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -prune \) -o \
+             -type f \( "${nameargs[@]}" \) -print0 2>/dev/null)
+    ok "Asset tampering check done."
+}
+
 scan_hashdb() {
     if [ ! -s "${HDB_FILE:-}" ]; then
         warn "rfxn.hdb not present - run 'update-sigs' first to enable hash scanning."
@@ -1314,6 +1381,51 @@ rule RS_split_string_include {
     condition:
         $a
 }
+
+rule RS_compress_zlib_stream_include {
+    meta:
+        description = "compress.zlib:// stream-wrapper paired with an include/eval/fetch call - how SEO cloakers load a gzip-compressed payload off disk without leaving plain-text PHP in the payload file itself"
+        severity = "HIGH"
+    strings:
+        $wrap = "compress.zlib://" nocase
+        $inc1 = /\b(include|include_once|require|require_once)\b/ nocase
+        $inc2 = /\beval\s*\(/ nocase
+        $inc3 = /\b(file_get_contents|readfile)\s*\(/ nocase
+    condition:
+        // Written as three ANDed pairs (logically $wrap and ($inc1 or $inc2
+        // or $inc3)) on purpose: this trips native_yara()'s skip-regex (two+
+        // "and"s), because its string-presence fallback can't distinguish
+        // "wrap AND an include/eval nearby" from "wrap alone" - and
+        // include(/require(/eval( are far too common to ever treat as an
+        // OR-fallback trigger on their own. See scan_compress_zlib_grep_fallback.
+        ($wrap and $inc1) or ($wrap and $inc2) or ($wrap and $inc3)
+}
+
+rule RS_compress_zlib_stream_bare_MED {
+    meta:
+        description = "compress.zlib:// stream wrapper referenced with no include/eval/fetch call in the same file - weaker signal (rare legitimate use exists), review manually"
+        severity = "MEDIUM"
+    strings:
+        $wrap = "compress.zlib://" nocase
+        $inc1 = /\b(include|include_once|require|require_once)\b/ nocase
+        $inc2 = /\beval\s*\(/ nocase
+        $inc3 = /\b(file_get_contents|readfile)\s*\(/ nocase
+    condition:
+        // "not" always trips native_yara()'s skip-regex; see
+        // scan_compress_zlib_grep_fallback for the unconditional equivalent.
+        $wrap and not ($inc1 or $inc2 or $inc3)
+}
+
+rule RS_cloaker_token_marker_MED {
+    meta:
+        description = "campaign-specific cloaker trigger/C2 token seen in Japanese spam-SEO loader kits - context marker only, not a standalone compromise indicator"
+        severity = "MEDIUM"
+    strings:
+        $t1 = "cf1988" nocase
+        $t2 = "ys001" nocase
+    condition:
+        any of them
+}
 RSYARA
 }
 
@@ -1708,6 +1820,33 @@ scan_secret_gated_exec_grep_fallback() {
     done < "$PHPLIST"
 }
 
+# scan_compress_zlib_grep_fallback: explicit grep-equivalent of
+# RS_compress_zlib_stream_include / RS_compress_zlib_stream_bare_MED. Both
+# rules are deliberately phrased (an extra "and", and a "not") to trip
+# native_yara()'s skip-regex, because its string-presence-only fallback
+# cannot tell "wrap AND an include/eval nearby" from "wrap alone present
+# anywhere" - and $inc1-3 below (include/require/eval/file_get_contents)
+# are far too common to ever treat as an OR-fallback trigger on their own.
+# Runs unconditionally; dedups against a real engine's hit via the shared
+# yara:RS_* category in finalize_report.
+scan_compress_zlib_grep_fallback() {
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -qF 'compress.zlib://' "$f" 2>/dev/null || continue
+        if grep -qE '\b(include|include_once|require|require_once)\b' "$f" 2>/dev/null \
+           || grep -qE '\beval\s*\(' "$f" 2>/dev/null \
+           || grep -qE '\b(file_get_contents|readfile)\s*\(' "$f" 2>/dev/null; then
+            report "HIGH" "yara:RS_compress_zlib_stream_include" "$rel" \
+                "matched YARA rule RS_compress_zlib_stream_include"
+        else
+            report "MED" "yara:RS_compress_zlib_stream_bare_MED" "$rel" \
+                "matched YARA rule RS_compress_zlib_stream_bare_MED"
+        fi
+    done < "$PHPLIST"
+}
+
 # scan_blockchain_js_loader: a long (>2KB) base64 string constant that DECODES
 # to JS calling eth_call against an RPC endpoint (sepolia/rpc/tenderly/
 # publicnode style) plus crypto.subtle or localStorage caching - a
@@ -2082,6 +2221,17 @@ scan_htaccess() {
         if grep -qIE 'base64|AddHandler|AddType[[:space:]]+application/x-httpd-php|auto_(ap|pre)pend_file|RewriteRule[^#]*(\.ru|\.cn|\.top)/' "$f" 2>/dev/null; then
             report "MED" "htaccess-suspicious" "${f#"$WPROOT"/}" "contains handler/append/base64/redirect directives - REVIEW"
         fi
+        # D4: auto_prepend_file/auto_append_file is a common persistence drop
+        # (every request through this directory silently runs the attacker's
+        # file first) - a dedicated HIGH with the target path, on top of the
+        # generic MED above, rather than leaving the operator to go dig for it.
+        local prepline; prepline="$(grep -iE 'auto_(prepend|append)_file' "$f" 2>/dev/null | head -1)"
+        if [ -n "$prepline" ]; then
+            local reprel="${f#"$WPROOT"/}" prepsev="HIGH"
+            allowpath_check "$reprel" && prepsev="INFO"
+            report "$prepsev" "htaccess-auto-prepend-persistence" "$reprel" \
+                "auto_prepend_file/auto_append_file directive - $(printf '%s' "$prepline" | sed -E 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        fi
         # .cache mapped to a PHP handler: zero legitimate use, a Rank Math PRO
         # supply-chain pattern (Oct 2026) for running the .cache files it drops.
         if grep -qiE '\.cache' "$f" 2>/dev/null \
@@ -2097,6 +2247,28 @@ scan_htaccess() {
         esac
     done < <(find "$WPROOT" -type f -name '.htaccess' -print0 2>/dev/null)
     ok ".htaccess audit done."
+}
+
+# D4 (other half): .user.ini is Apache/PHP-FPM's per-directory ini override -
+# an attacker-dropped one under wp-content/uploads or a theme/plugin dir gets
+# auto_prepend_file run on every PHP request in that directory, with nothing
+# to see in any .php file at all. Nothing else in this script reads .user.ini.
+scan_user_ini() {
+    info "Checking .user.ini files for auto_prepend/auto_append persistence..."
+    local f rel line path sev
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        while IFS= read -r line; do
+            path="${line#*=}"
+            path="$(printf '%s' "$path" | sed -E "s/^[[:space:]]*//;s/[[:space:]]*\$//;s/^[\"']//;s/[\"']\$//")"
+            [ -n "$path" ] || continue
+            sev="HIGH"
+            allowpath_check "$rel" && sev="INFO"
+            report "$sev" "ini-auto-prepend-persistence" "$rel" \
+                "auto_prepend_file/auto_append_file persistence in .user.ini -> $path"
+        done < <(grep -iE '^[[:space:]]*auto_(prepend|append)_file[[:space:]]*=' "$f" 2>/dev/null)
+    done < <(find "$WPROOT" -type f -name '.user.ini' -print0 2>/dev/null)
+    ok ".user.ini audit done."
 }
 
 # ------------------------------ database scan --------------------------------
@@ -2943,6 +3115,7 @@ run_scan() {
     scan_blockchain_js_loader
     scan_wpconfig_content
     scan_uploads_php
+    scan_asset_tampering
     scan_exploit_upload_paths
     scan_hashdb
     scan_yara
@@ -2953,10 +3126,12 @@ run_scan() {
     scan_option_js_injector_grep_fallback
     scan_rest_backdoor_grep_fallback
     scan_secret_gated_exec_grep_fallback
+    scan_compress_zlib_grep_fallback
     scan_heuristics
     scan_nulled
     scan_external_requests
     scan_htaccess
+    scan_user_ini
     scan_database
     scan_updraftcentral_variant2_indicators
     scan_rankmath_readonly_indicators
