@@ -37,7 +37,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.23-free"
+RS_VERSION="2.9.24-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -77,9 +77,80 @@ info() { printf '%s[ .. ]%s %s\n'   "$C_CYN" "$C_OFF" "$*"; }
 notice() { printf '%s[NOTE ]%s %s\n' "$C_CYN" "$C_OFF" "$*"; }   # advisory text, never written to $REPORT
 die()  { printf '%s[FAIL]%s %s\n'   "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
 
+# ------------------------------ temp files -----------------------------------
+# Every mktemp in this script goes through rs_tmp(): one place that (a) always
+# lands under $RS_CACHE - never /tmp, which is shared across accounts on some
+# hosts - and (b) is cleaned up on exit/interrupt via the trap below, so a
+# Ctrl+C mid-scan or mid-share-report never leaves a stray file behind (some
+# of these briefly hold a DB password/salts in plaintext). Also replaces every
+# `<( ... )` process substitution in this script - process substitution is
+# implemented via /dev/fd/NN, which does not exist on CageFS-jailed cPanel
+# accounts (common on shared hosting), silently failing every "<(cmd)" use
+# while still printing "[ OK ]" for the check that depended on it. Plain files
+# work identically everywhere: CageFS, other cPanel hosts, Ubuntu, macOS.
+#
+# Registration is a FILE (one path per line), not a shell array: every call
+# site uses `var="$(rs_tmp name)"`, and command substitution always runs the
+# function in a subshell - an array append inside rs_tmp would mutate only
+# that subshell's copy and vanish the instant it exits, silently never
+# registering anything. Appending to a file has a real, persistent effect
+# regardless of which subshell does the writing.
+RS_TMPREG="$RS_CACHE/.rs-tmpfiles-$$"
+rs_tmp() { # rs_tmp NAME -> path to a new empty temp file under $RS_CACHE
+    local name="$1" f
+    f="$(mktemp "$RS_CACHE/${name}.XXXXXX" 2>/dev/null)" || f="$RS_CACHE/${name}.$$.$RANDOM"
+    : > "$f" 2>/dev/null
+    printf '%s\n' "$f" >> "$RS_TMPREG" 2>/dev/null
+    printf '%s\n' "$f"
+}
+rs_cleanup() {
+    [ -f "$RS_TMPREG" ] || return 0
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && rm -f "$f" 2>/dev/null
+    done < "$RS_TMPREG"
+    rm -f "$RS_TMPREG"
+}
+# A trap registered on INT/TERM/HUP runs the handler and then RESUMES the
+# script where it left off - it does not stop execution on its own. Only the
+# EXIT trap needs just rs_cleanup; INT/TERM/HUP must explicitly exit so
+# Ctrl+C (or a host-imposed timeout sending SIGTERM) actually stops the scan
+# instead of cleaning up mid-file and continuing. exit always re-triggers the
+# EXIT trap, so cleanup still happens exactly once either way.
+trap 'rs_cleanup' EXIT
+trap 'exit 130' INT TERM HUP
+
 # report(): append a finding line to the machine-readable report.
 # Format:  SEVERITY <TAB> CATEGORY <TAB> PATH-OR-ITEM <TAB> DETAIL
 report() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$REPORT"; }
+
+# check_incomplete NAME REASON -> a required check's input was missing, empty,
+# or its producer command failed. Warns, records a MED check-incomplete
+# finding (counted by run_scan's summary into "scan INCOMPLETE"), and returns
+# - the caller must NOT print its own "... done."/ok() after this, and any
+# file this check would have populated (e.g. $VERIFIED) is left exactly as
+# it was, so downstream scanners correctly treat its files as unverified
+# rather than silently reading a failed check as "nothing to report."
+check_incomplete() {
+    warn "$1: $2 - treating as UNVERIFIED, not clean"
+    report "MED" "check-incomplete" "$1" "$2"
+}
+
+# rs_timed FUNCNAME -> runs it; under RS_DEBUG=1 also prints elapsed seconds,
+# so a future "the scan looks stuck" report can say which scanner it's in
+# instead of guessing (this is exactly what would have pinpointed the
+# CageFS VERIFIED-empty slowdown immediately instead of reading as a hang).
+rs_timed() {
+    if [ "${RS_DEBUG:-0}" = "1" ]; then
+        local name="$1" start end
+        start="$(date +%s)"
+        "$@"
+        end="$(date +%s)"
+        info "[debug] $name took $((end-start))s"
+    else
+        "$@"
+    fi
+}
 
 fetch() { # fetch URL OUTFILE  (curl or wget, whichever exists)
     local url="$1" out="$2"
@@ -404,6 +475,10 @@ scan_core_orphans() {
     # Known stock top-level PHP (webroot). Anything else *.php at root is suspect.
     local root_ok="|index.php|wp-activate.php|wp-blog-header.php|wp-comments-post.php|wp-config.php|wp-config-sample.php|wp-cron.php|wp-links-opml.php|wp-load.php|wp-login.php|wp-mail.php|wp-settings.php|wp-signup.php|wp-trackback.php|xmlrpc.php|"
     local f rel base
+    local root_list; root_list="$(rs_tmp core-orphan-root)"
+    if ! find "$WPROOT" -maxdepth 1 -type f -name '*.php' -print0 > "$root_list" 2>/dev/null; then
+        check_incomplete "core-orphans" "find failed listing webroot top-level PHP"
+    fi
     # webroot top-level php
     while IFS= read -r -d '' f; do
         base="$(basename "$f")"
@@ -413,11 +488,15 @@ scan_core_orphans() {
             grep -Fq $'\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
             report "HIGH" "core-orphan-file" "$rel" "unexpected PHP at WordPress root (not a stock core file) - verify manually (cleanup: RatSweepr Cleanup Kit / Done-For-You at ratsweepr.com)"
         ;; esac
-    done < <(find "$WPROOT" -maxdepth 1 -type f -name '*.php' -print0 2>/dev/null)
+    done < "$root_list"
     # wp-admin / wp-includes: only flag files whose NAME looks out-of-place for core
     # (core uses wp-*/class-*/ms-* plus a known set of bare names). To avoid noise we
     # exempt the common bare core filenames and only surface genuinely odd names.
     local core_bare="|version.php|functions.php|general-template.php|link-template.php|option.php|options.php|plugin.php|theme.php|user.php|post.php|comment.php|category.php|feed.php|cron.php|load.php|media.php|meta.php|nav-menu.php|pluggable.php|rewrite.php|shortcodes.php|taxonomy.php|template.php|update.php|widgets.php|index.php|admin.php|menu.php|about.php|nav-menus.php|upgrade.php|install.php|"
+    local core_list; core_list="$(rs_tmp core-orphan-coredirs)"
+    if ! find "$WPROOT/wp-admin" "$WPROOT/wp-includes" -maxdepth 1 -type f -name '*.php' -print0 > "$core_list" 2>/dev/null; then
+        check_incomplete "core-orphans" "find failed listing wp-admin/wp-includes top-level PHP"
+    fi
     while IFS= read -r -d '' f; do
         base="$(basename "$f")"
         case "$base" in
@@ -428,7 +507,7 @@ scan_core_orphans() {
         grep -Fq $'\tcore-unknown-file\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
         grep -Fq $'\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
         report "MED" "core-orphan-file" "$rel" "unusually-named PHP in a core directory - review (core files are wp-*/class-*/ms-*)"
-    done < <(find "$WPROOT/wp-admin" "$WPROOT/wp-includes" -maxdepth 1 -type f -name '*.php' -print0 2>/dev/null)
+    done < "$core_list"
 }
 
 scan_core_checksums() {
@@ -441,18 +520,24 @@ scan_core_checksums() {
     local js="$RS_CACHE/core-$WPVER.json"
     if [ ! -s "$js" ]; then
         fetch "https://api.wordpress.org/core/checksums/1.0/?version=$WPVER&locale=en_US" "$js" \
-            || { warn "Could not download core checksums."; return; }
+            || { check_incomplete "core-checksums" "could not download the checksum API response for $WPVER"; return; }
     fi
+    [ -s "$js" ] || { check_incomplete "core-checksums" "checksum API response for $WPVER is missing or empty"; return; }
     local manifest="$RS_CACHE/core-$WPVER.md5"
     php_json 'foreach($d["checksums"] as $f=>$m) echo $m."  ".$f."\n";' \
         < "$js" > "$manifest" 2>/dev/null
     if [ ! -s "$manifest" ]; then
-        warn "Checksum API returned no data for $WPVER."; return
+        check_incomplete "core-checksums" "checksum API returned no usable data for $WPVER"
+        return
     fi
 
     local fails=0 faillist="$RS_CACHE/core-fails.$$" bundled_missing="$RS_CACHE/core-bundled-missing.$$"
     : > "$faillist"; : > "$bundled_missing"
-    # md5sum -c reports FAILED / missing files; --quiet hides the OKs.
+    # md5sum -c reports FAILED / missing files; --quiet hides the OKs. Its own
+    # exit status isn't checked - nonzero just means "something differed",
+    # which is the normal case on an infected or lightly-customized site.
+    local md5out; md5out="$(rs_tmp core-md5out)"
+    ( cd "$WPROOT" && md5sum -c --quiet "$manifest" 2>/dev/null ) > "$md5out"
     while IFS= read -r line; do
         local f="${line%%:*}"
         printf '%s\n' "$f" >> "$faillist"
@@ -472,21 +557,35 @@ scan_core_checksums() {
                 report "HIGH" "core-modified" "$f" "does not match official $WPVER checksum";;
         esac
         fails=$((fails+1))
-    done < <(cd "$WPROOT" && md5sum -c --quiet "$manifest" 2>/dev/null)
+    done < "$md5out"
     if [ -s "$bundled_missing" ]; then
+        local bmcomp; bmcomp="$(rs_tmp core-bmcomp)"
         awk -F'/' '{
             if (NF>=3 && ($2=="themes" || $2=="plugins" || $2=="mu-plugins")) comp=$2"/"$3
             else comp=$2
             cnt[comp]++
-        } END { for (c in cnt) printf "%s\t%d\n", c, cnt[c] }' "$bundled_missing" | sort \
-        | while IFS=$'\t' read -r comp bcnt; do
+        } END { for (c in cnt) printf "%s\t%d\n", c, cnt[c] }' "$bundled_missing" | sort > "$bmcomp"
+        while IFS=$'\t' read -r comp bcnt; do
             report "INFO" "core-bundled-missing" "wp-content/$comp" "$bcnt bundled file(s) absent (often intentional)"
-        done
+        done < "$bmcomp"
     fi
     rm -f "$bundled_missing"
+
     # Every manifest file that did NOT fail is integrity-verified: heuristics
     # must never flag a file that is byte-identical to the official release.
-    comm -23 <(awk '{print $2}' "$manifest" | sort) <(sort -u "$faillist") >> "$VERIFIED"
+    # comm needs real files (not <(...)/dev-fd process substitution, which
+    # doesn't exist on CageFS-jailed cPanel accounts and fails silently,
+    # leaving $VERIFIED empty while this still looked like it worked).
+    local manifest_sorted; manifest_sorted="$(rs_tmp core-manifest-sorted)"
+    local faillist_sorted; faillist_sorted="$(rs_tmp core-faillist-sorted)"
+    local verified_add; verified_add="$(rs_tmp core-verified-add)"
+    awk '{print $2}' "$manifest" | sort > "$manifest_sorted"
+    sort -u "$faillist" > "$faillist_sorted"
+    if ! comm -23 "$manifest_sorted" "$faillist_sorted" > "$verified_add" 2>/dev/null; then
+        check_incomplete "core-checksums" "comm failed computing the verified-file list - core files are UNVERIFIED this run"
+        return
+    fi
+    cat "$verified_add" >> "$VERIFIED"
 
     # Files present on disk in core dirs but NOT in the manifest = dropped files.
     local expected="$RS_CACHE/core-expected.$$" actual="$RS_CACHE/core-actual.$$"
@@ -496,6 +595,17 @@ scan_core_checksums() {
            -printf '%P\n' 2>/dev/null || \
       find . -maxdepth 1 -type f -name '*.php' ! -name 'wp-config.php' \
            | sed 's|^\./||' ) | sort -u > "$actual"
+    if [ ! -s "$expected" ] || [ ! -s "$actual" ]; then
+        check_incomplete "core-checksums" "expected/actual core file list came back empty - unknown-file detection skipped this run"
+        rm -f "$expected" "$actual"
+        return
+    fi
+    local extra_list; extra_list="$(rs_tmp core-extra-list)"
+    if ! comm -13 "$expected" "$actual" > "$extra_list" 2>/dev/null; then
+        check_incomplete "core-checksums" "comm failed diffing expected vs. actual core files - unknown-file detection skipped this run"
+        rm -f "$expected" "$actual"
+        return
+    fi
     while IFS= read -r extra; do
         case "$extra" in
             *.php|*.php[0-9]|*.phtml|*.phar)
@@ -519,7 +629,7 @@ scan_core_checksums() {
             *)
                 report "MED" "core-extra-file" "$extra" "unexpected non-core file in core area, not in official $WPVER manifest - review";;
         esac
-    done < <(comm -13 "$expected" "$actual")
+    done < "$extra_list"
     rm -f "$expected" "$actual"
     MANIFEST_OK=1   # unknown-file detection ran against a real manifest; orphan fallback not needed
     ok "Core verification done."
@@ -647,6 +757,8 @@ scan_plugin_checksums() {
                 || { report "INFO" "plugin-premium" "wp-content/plugins/$slug ($ver)" \
                      "not on wordpress.org - verify manually (cleanup: RatSweepr Cleanup Kit / Done-For-You at ratsweepr.com)"; rm -f "$js"; continue; }
         fi
+        [ -s "$js" ] || { report "INFO" "plugin-premium" "wp-content/plugins/$slug ($ver)" \
+                          "checksum data download produced an empty file"; rm -f "$js"; continue; }
         manifest="$RS_CACHE/plugin-$slug-$ver.list"
         # Emits: relpath <TAB> md5a,md5b  (the API may list several valid md5s)
         php_json 'if(!isset($d["files"])) exit(2);
@@ -670,11 +782,20 @@ scan_plugin_checksums() {
         # extra files inside the plugin dir not in the manifest
         local expected="$RS_CACHE/pl-exp.$$" actual="$RS_CACHE/pl-act.$$"
         cut -f1 "$manifest" | sort > "$expected"
-        ( cd "$plugdir" && find . -type f | sed 's|^\./||' ) | sort > "$actual"
-        while IFS= read -r extra; do
-            report "MED" "plugin-unknown-file" "wp-content/plugins/$slug/$extra" \
-                   "file not in official $slug $ver package"
-        done < <(comm -13 "$expected" "$actual")
+        if ! ( cd "$plugdir" && find . -type f | sed 's|^\./||' ) | sort > "$actual"; then
+            check_incomplete "plugin-checksums:$slug" "could not list plugin directory contents - extra-file detection skipped for this plugin"
+            rm -f "$expected" "$actual"
+            continue
+        fi
+        local pl_extra; pl_extra="$(rs_tmp pl-extra)"
+        if comm -13 "$expected" "$actual" > "$pl_extra" 2>/dev/null; then
+            while IFS= read -r extra; do
+                report "MED" "plugin-unknown-file" "wp-content/plugins/$slug/$extra" \
+                       "file not in official $slug $ver package"
+            done < "$pl_extra"
+        else
+            check_incomplete "plugin-checksums:$slug" "comm failed diffing expected vs. actual plugin files - extra-file detection skipped for this plugin"
+        fi
         rm -f "$expected" "$actual"
         [ "$modified" = "0" ] || bad "$slug: $modified modified file(s)"
     done
@@ -723,20 +844,24 @@ wpconfig_flagged_lines() { # emits CATEGORY<TAB>LINENO<TAB>CODE for every flagge
     [ -f "$wc" ] || return 0
     local raw lnum lcontent
     # rogue require/include of anything that isn't the normal wp-settings/ABSPATH bootstrap
+    local wcrogue; wcrogue="$(rs_tmp wpconfig-rogue)"
+    grep -nE "^[[:space:]]*(require|include)(_once)?[[:space:]]*[('\"]" "$wc" 2>/dev/null \
+        | grep -viE 'wp-settings\.php|ABSPATH|dirname\(__FILE__\)|__DIR__' > "$wcrogue"
     while IFS= read -r raw; do
         [ -n "$raw" ] || continue
         lnum="${raw%%:*}"; lcontent="${raw#*:}"
         case "$lnum" in ''|*[!0-9]*) lnum="0" ;; esac
         printf 'wp-config-rogue-include\t%s\t%s\n' "$lnum" "$lcontent"
-    done < <(grep -nE "^[[:space:]]*(require|include)(_once)?[[:space:]]*[('\"]" "$wc" 2>/dev/null \
-             | grep -viE 'wp-settings\.php|ABSPATH|dirname\(__FILE__\)|__DIR__' )
+    done < "$wcrogue"
     # injected eval/base64/exec constructs in wp-config
+    local wcinject; wcinject="$(rs_tmp wpconfig-inject)"
+    grep -nE 'eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|\$_(GET|POST|REQUEST|COOKIE)\[|assert\s*\(|create_function\s*\(' "$wc" 2>/dev/null > "$wcinject"
     while IFS= read -r raw; do
         [ -n "$raw" ] || continue
         lnum="${raw%%:*}"; lcontent="${raw#*:}"
         case "$lnum" in ''|*[!0-9]*) lnum="0" ;; esac
         printf 'wp-config-injected-code\t%s\t%s\n' "$lnum" "$lcontent"
-    done < <(grep -nE 'eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|\$_(GET|POST|REQUEST|COOKIE)\[|assert\s*\(|create_function\s*\(' "$wc" 2>/dev/null )
+    done < "$wcinject"
 }
 
 scan_wpconfig_content() {
@@ -745,12 +870,14 @@ scan_wpconfig_content() {
     # CONTENT for rogue includes and injected code, active or commented-out.
     [ -f "$WPROOT/wp-config.php" ] || return
     local cat lnum content label
+    local flagged; flagged="$(rs_tmp wpconfig-flagged)"
+    wpconfig_flagged_lines > "$flagged"
     while IFS=$'\t' read -r cat lnum content; do
         [ -n "$cat" ] || continue
         if [ "$lnum" = "0" ]; then label="line unknown, review the whole file"; else label="L$lnum"; fi
         report "HIGH" "$cat" "wp-config.php" \
             "$label: $(printf '%s' "$content" | sed 's/^[[:space:]]*//' | mask_wpconfig_secrets | cut -c1-80)"
-    done < <(wpconfig_flagged_lines)
+    done < "$flagged"
 }
 
 wp_config_review() { # read-only: show flagged wp-config.php lines with context, secrets masked
@@ -788,6 +915,9 @@ EOF
 scan_uploads_php() {
     info "Scanning wp-content/uploads for PHP files (should contain none)..."
     [ -d "$WPROOT/wp-content/uploads" ] || return
+    local uplist; uplist="$(rs_tmp uploads-php)"
+    find "$WPROOT/wp-content/uploads" -type f \
+         \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' \) -print0 > "$uplist"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         # Many legit plugins drop an empty "Silence is golden" index.php guard.
@@ -800,8 +930,7 @@ scan_uploads_php() {
         else
             report "HIGH" "php-in-uploads" "$rel" "executable PHP inside uploads - almost always malicious"
         fi
-    done < <(find "$WPROOT/wp-content/uploads" -type f \
-             \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' \) -print0)
+    done < "$uplist"
     ok "Uploads scan done."
 }
 
@@ -824,6 +953,9 @@ scan_asset_tampering() {
         nameargs+=(-iname "*.$e")
     done
     local f rel sz magic head
+    local assetlist; assetlist="$(rs_tmp asset-tampering)"
+    find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -prune \) -o \
+         -type f \( "${nameargs[@]}" \) -print0 2>/dev/null > "$assetlist"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         case "$rel" in *.gz) continue;; esac   # legitimate pre-compressed assets
@@ -867,8 +999,7 @@ scan_asset_tampering() {
             report "HIGH" "php-in-nonphp-extension" "$rel" \
                 "PHP open tag + eval/decode combo inside a file with a non-PHP extension - review"
         fi
-    done < <(find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -prune \) -o \
-             -type f \( "${nameargs[@]}" \) -print0 2>/dev/null)
+    done < "$assetlist"
     ok "Asset tampering check done."
 }
 
@@ -1463,8 +1594,9 @@ scan_yara() {
     local rulefiles=(); rulefiles+=("$rulesdir/ratsweepr.yar")
     [ -f "$rulesdir/remote.yar" ] && rulefiles+=("$rulesdir/remote.yar")
     if [ -n "${RS_YARA_RULES:-}" ] && [ -d "$RS_YARA_RULES" ]; then
-        while IFS= read -r rf; do rulefiles+=("$rf"); done \
-            < <(find "$RS_YARA_RULES" \( -name '*.yar' -o -name '*.yara' \) 2>/dev/null)
+        local extra_rules; extra_rules="$(rs_tmp yara-extra-rules)"
+        find "$RS_YARA_RULES" \( -name '*.yar' -o -name '*.yara' \) 2>/dev/null > "$extra_rules"
+        while IFS= read -r rf; do rulefiles+=("$rf"); done < "$extra_rules"
     fi
 
     # --- engine: system yara, else Path A (auto-download static yara-x), else native ---
@@ -1737,13 +1869,15 @@ scan_rankmath_fake_core_file() {
 # scan_cache_php_files: a .cache file should be inert cached data, never PHP.
 scan_cache_php_files() {
     local f rel
+    local cachelist; cachelist="$(rs_tmp cache-php-files)"
+    find "$WPROOT" -type f -name '*.cache' -print0 2>/dev/null > "$cachelist"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         if head -c 64 "$f" 2>/dev/null | grep -qE '^[[:space:]]*<\?php'; then
             report "HIGH" "cache-file-php" "$rel" \
                 "a .cache file whose content starts with a PHP open tag - not a real cache artifact (Rank Math PRO supply-chain pattern, Oct 2026)"
         fi
-    done < <(find "$WPROOT" -type f -name '*.cache' -print0 2>/dev/null)
+    done < "$cachelist"
 }
 
 # ===================== real-site follow-up detections (Oct 2026) =============
@@ -1863,18 +1997,22 @@ scan_blockchain_js_loader() {
     # exceeds 255") on anything larger; chaining keeps every individual count
     # under that limit while still requiring the same total run length.
     local longrun='([A-Za-z0-9+/]{100}){27,}[A-Za-z0-9+/]*={0,2}'
-    local f rel candidate n tmp
+    local f rel candidate n tmp candlist
     # Decode into a file, never a variable: a base64 constant can legitimately
     # decode to binary (an embedded font/image), and bash's $(...) prints
     # "warning: command substitution: ignored null byte in input" to stderr
     # for every such candidate - harmless but noisy (seen ~15x on a real
-    # site). One reused tmp file for the whole function; removed on return.
-    tmp="$(mktemp "${TMPDIR:-/tmp}/rs-b64js.XXXXXX")" || return
+    # site). One reused tmp file for the whole function, under $RS_CACHE (not
+    # /tmp, which is shared across accounts on some hosts) and registered
+    # with the rs_tmp/rs_cleanup trap in case the scan is interrupted mid-file.
+    tmp="$(rs_tmp rs-b64js)" || return
+    candlist="$(rs_tmp rs-b64js-candidates)"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
         # cheap pre-filter: only decode files that actually contain a run this long
         grep -qE "$longrun" "$f" 2>/dev/null || continue
+        grep -oE "$longrun" "$f" 2>/dev/null > "$candlist"
         n=0
         while IFS= read -r candidate && [ "$n" -lt 5 ]; do
             n=$((n+1))
@@ -1891,9 +2029,9 @@ scan_blockchain_js_loader() {
                     "a >2KB base64 constant decodes to JS calling eth_call against an RPC endpoint (sepolia/rpc/tenderly/publicnode) plus crypto.subtle/localStorage - blockchain-hosted malware loader"
                 break
             fi
-        done < <(grep -oE "$longrun" "$f" 2>/dev/null)
+        done < "$candlist"
     done < "$PHPLIST"
-    rm -f "$tmp"
+    rm -f "$tmp" "$candlist"
 }
 
 # scan_rankmath_readonly_indicators: published IOCs a file/content rule can't
@@ -1965,10 +2103,12 @@ scan_exploit_upload_paths() {
             done
         done
     done
+    local loginadmin; loginadmin="$(rs_tmp login-admin-dropper)"
+    find "$WPROOT/wp-content/uploads" -type f -iname 'login_admin_*.php' -print0 2>/dev/null > "$loginadmin"
     while IFS= read -r -d '' f; do
         report "HIGH" "exploit-upload-path" "${f#"$WPROOT"/}" \
             "file matches the login_admin_*.php exploit-dropper naming pattern; quarantine"
-    done < <(find "$WPROOT/wp-content/uploads" -type f -iname 'login_admin_*.php' -print0 2>/dev/null)
+    done < "$loginadmin"
 }
 
 # plugin_installed_version PLUGDIR/ -> prints the version from the file
@@ -2071,11 +2211,13 @@ scan_vulnerable_plugins() {
 scan_heuristics() {
     info "Running heuristic pattern scan (grep, from patterns.conf)..."
     local name rex n=0
+    local hitlist; hitlist="$(rs_tmp heuristic-hits)"
     while IFS='|' read -r type name rex; do
         case "$type" in \#*|"") continue;; esac
         if [ "$type" = "GREP" ] || [ "$type" = "GREPHIGH" ]; then
             n=$((n+1))
             local basesev="MED"; [ "$type" = "GREPHIGH" ] && basesev="HIGH"
+            { xargs -0 grep -lIE --null -e "$rex" < "$PHPLIST" 2>/dev/null || true; } > "$hitlist"
             while IFS= read -r -d '' f; do
                 rel="${f#"$WPROOT"/}"
                 grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
@@ -2091,11 +2233,12 @@ scan_heuristics() {
                 else
                     report "$basesev" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW"
                 fi
-            done < <(xargs -0 grep -lIE --null -e "$rex" < "$PHPLIST" 2>/dev/null || true)
+            done < "$hitlist"
         elif [ "$type" = "FNAME" ]; then
+            find "$WPROOT" -type f -name "$rex" -print0 2>/dev/null > "$hitlist"
             while IFS= read -r -d '' f; do
                 report "MED" "filename:$name" "${f#"$WPROOT"/}" "suspicious file name pattern"
-            done < <(find "$WPROOT" -type f -name "$rex" -print0 2>/dev/null)
+            done < "$hitlist"
         fi
     done < "$PATTERNS_FILE"
     ok "Heuristic scan done ($n grep patterns)."
@@ -2105,12 +2248,14 @@ scan_nulled() {
     info "Checking for nulled-plugin indicators..."
     # 1. piracy domain references anywhere in PHP
     local name dom
+    local domhits; domhits="$(rs_tmp nulled-domain-hits)"
     while IFS='|' read -r type name dom; do
         [ "$type" = "DOMAIN" ] || continue
+        { xargs -0 grep -lIF --null -e "$dom" < "$PHPLIST" 2>/dev/null || true; } > "$domhits"
         while IFS= read -r -d '' f; do
             grep -Fxq "${f#"$WPROOT"/}" "$VERIFIED" 2>/dev/null && continue
             report "HIGH" "nulled-domain:$name" "${f#"$WPROOT"/}" "references piracy/nulled domain $dom"
-        done < <(xargs -0 grep -lIF --null -e "$dom" < "$PHPLIST" 2>/dev/null || true)
+        done < "$domhits"
     done < "$PATTERNS_FILE"
 
     # 2. absurd version pins (the 'version 9999' trick blocks all updates)
@@ -2217,6 +2362,8 @@ scan_external_requests() {
 
 scan_htaccess() {
     info "Auditing .htaccess files..."
+    local htlist; htlist="$(rs_tmp htaccess-files)"
+    find "$WPROOT" -type f -name '.htaccess' -print0 2>/dev/null > "$htlist"
     while IFS= read -r -d '' f; do
         if grep -qIE 'base64|AddHandler|AddType[[:space:]]+application/x-httpd-php|auto_(ap|pre)pend_file|RewriteRule[^#]*(\.ru|\.cn|\.top)/' "$f" 2>/dev/null; then
             report "MED" "htaccess-suspicious" "${f#"$WPROOT"/}" "contains handler/append/base64/redirect directives - REVIEW"
@@ -2245,7 +2392,7 @@ scan_htaccess() {
                 grep -qIE 'php_flag[[:space:]]+engine[[:space:]]+off|Deny from all|Require all denied' "$f" 2>/dev/null \
                     || report "INFO" "htaccess-uploads" "${f#"$WPROOT"/}" ".htaccess in uploads without PHP-off directives";;
         esac
-    done < <(find "$WPROOT" -type f -name '.htaccess' -print0 2>/dev/null)
+    done < "$htlist"
     ok ".htaccess audit done."
 }
 
@@ -2256,8 +2403,12 @@ scan_htaccess() {
 scan_user_ini() {
     info "Checking .user.ini files for auto_prepend/auto_append persistence..."
     local f rel line path sev
+    local inilist; inilist="$(rs_tmp user-ini-files)"
+    find "$WPROOT" -type f -name '.user.ini' -print0 2>/dev/null > "$inilist"
+    local inihits; inihits="$(rs_tmp user-ini-hits)"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
+        grep -iE '^[[:space:]]*auto_(prepend|append)_file[[:space:]]*=' "$f" 2>/dev/null > "$inihits"
         while IFS= read -r line; do
             path="${line#*=}"
             path="$(printf '%s' "$path" | sed -E "s/^[[:space:]]*//;s/[[:space:]]*\$//;s/^[\"']//;s/[\"']\$//")"
@@ -2266,8 +2417,8 @@ scan_user_ini() {
             allowpath_check "$rel" && sev="INFO"
             report "$sev" "ini-auto-prepend-persistence" "$rel" \
                 "auto_prepend_file/auto_append_file persistence in .user.ini -> $path"
-        done < <(grep -iE '^[[:space:]]*auto_(prepend|append)_file[[:space:]]*=' "$f" 2>/dev/null)
-    done < <(find "$WPROOT" -type f -name '.user.ini' -print0 2>/dev/null)
+        done < "$inihits"
+    done < "$inilist"
     ok ".user.ini audit done."
 }
 
@@ -2493,6 +2644,14 @@ scan_admin_exploit_correlation() {
     # 8) admin accounts created within 60s of a customize_changeset modification -
     #    the "backdoor admin planted in the same request as a PoC" fingerprint.
     local prev_id=""
+    local adminexploit; adminexploit="$(rs_tmp admin-exploit-correlation)"
+    db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered,
+                   ABS(TIMESTAMPDIFF(SECOND, u.user_registered, c.post_modified))
+            FROM ${P}users u
+            JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' AND m.meta_value LIKE '%administrator%'
+            JOIN ${P}posts c ON c.post_type='customize_changeset'
+            WHERE ABS(TIMESTAMPDIFF(SECOND, u.user_registered, c.post_modified)) <= 60
+            ORDER BY u.ID;" > "$adminexploit"
     while IFS=$'\t' read -r aid login email reg diffsec; do
         [ -n "$aid" ] || continue
         case "$aid" in ''|*[!0-9]*) continue;; esac
@@ -2505,13 +2664,7 @@ scan_admin_exploit_correlation() {
                 "gap=$((aid - prev_id)) since the previous flagged administrator ID ($prev_id)"
         fi
         prev_id="$aid"
-    done < <(db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered,
-                   ABS(TIMESTAMPDIFF(SECOND, u.user_registered, c.post_modified))
-            FROM ${P}users u
-            JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' AND m.meta_value LIKE '%administrator%'
-            JOIN ${P}posts c ON c.post_type='customize_changeset'
-            WHERE ABS(TIMESTAMPDIFF(SECOND, u.user_registered, c.post_modified)) <= 60
-            ORDER BY u.ID;")
+    done < "$adminexploit"
 
     # 12) window never downgrades 8/9 - and when either fires, print the
     #     earliest changeset date as the likely real compromise date.
@@ -2541,10 +2694,12 @@ scan_admin_session_review() {
     [ -n "$ids" ] || return
 
     local id raw
+    local sess_ips; sess_ips="$(rs_tmp admin-session-ips)"
     for id in $ids; do
         raw="$(db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$id AND meta_key='session_tokens';")"
         [ -n "$raw" ] || continue
         local ip n=0
+        printf '%s' "$raw" | grep -oE 's:2:"ip";s:[0-9]+:"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' > "$sess_ips"
         while IFS= read -r ip; do
             n=$((n+1))
             # best-effort: session_tokens serializes each entry as
@@ -2561,7 +2716,7 @@ scan_admin_session_review() {
                 login="$(date -r "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'epoch:%s' "$epoch")"
             fi
             report "MED" "admin-session" "user:$id" "session IP=$ip login=$login - review and destroy if not recognized"
-        done < <(printf '%s' "$raw" | grep -oE 's:2:"ip";s:[0-9]+:"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')
+        done < "$sess_ips"
         [ "$n" -gt 0 ] && notice "Admin user:$id has $n session(s) listed above - recommend destroying all sessions and rotating salts/passwords."
     done
 }
@@ -2573,19 +2728,25 @@ scan_cve_artifacts() {
     # the public exploit writes marker/webshell files with distinctive names to
     # /tmp, /var/tmp and the webroot. These names are near-unique to the exploit.
     local f
+    local cve_artifacts; cve_artifacts="$(rs_tmp cve-87902-artifacts)"
+    find /tmp /var/tmp "$WPROOT" -maxdepth 3 -type f \
+         \( -name 'wp-pear-rce-flag.php' -o -name 'poc87902.php' \
+            -o -name 'luci_*.php' -o -name 'zeta_*.php' \) -print0 2>/dev/null \
+        | head -c 100000 > "$cve_artifacts"
     while IFS= read -r -d '' f; do
         [ -n "$f" ] || continue
         report "HIGH" "cve-2026-87902-artifact" "$f" \
             "CVE-2026-87902 LFI->RCE payload dropped by the PEAR exploit - upgrade to WP 7.1.2 and remove this file"
-    done < <(find /tmp /var/tmp "$WPROOT" -maxdepth 3 -type f \
-             \( -name 'wp-pear-rce-flag.php' -o -name 'poc87902.php' \
-                -o -name 'luci_*.php' -o -name 'zeta_*.php' \) -print0 2>/dev/null | head -c 100000)
+    done < "$cve_artifacts"
+    local cve_markers; cve_markers="$(rs_tmp cve-87902-markers)"
+    grep -rliE --include='*.php' --include='*.phtml' 'wp-pear-rce|cve-2026-87902' "$WPROOT" 2>/dev/null \
+        | grep -vE 'ratsweepr\.sh$|ratsweepr\.yar$|ratsweepr-sigs\.conf$|ratsweepr-[0-9].*\.report$|patterns\.conf$|/\.ratsweepr/|\.sql$|/backups?/|/wp-?vivid|/updraft|/ai1wm|/backwpup' \
+        | head -50 > "$cve_markers"
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         report "HIGH" "cve-2026-87902-marker" "${f#"$WPROOT"/}" \
             "file contains a CVE-2026-87902 exploit marker (wp-pear-rce / cve-2026-87902 / pearcmd)"
-    done < <(grep -rliE --include='*.php' --include='*.phtml' 'wp-pear-rce|cve-2026-87902' "$WPROOT" 2>/dev/null \
-             | grep -vE 'ratsweepr\.sh$|ratsweepr\.yar$|ratsweepr-sigs\.conf$|ratsweepr-[0-9].*\.report$|patterns\.conf$|/\.ratsweepr/|\.sql$|/backups?/|/wp-?vivid|/updraft|/ai1wm|/backwpup' | head -50)
+    done < "$cve_markers"
 }
 
 scan_compromise_indicators() {
@@ -2643,65 +2804,80 @@ scan_compromise_indicators() {
     fi
 
     # 2) Admin/any users registered on/after the disclosure date.
+    local evuser; evuser="$(rs_tmp compromise-evidence-user)"
+    db_query "SELECT ID, user_login, user_email, user_registered FROM ${P}users WHERE user_registered >= '$EXPLOIT_WINDOW_START 00:00:00' ORDER BY ID DESC LIMIT 100;" > "$evuser"
     while IFS=$'\t' read -r id login email reg; do
         [ -n "$id" ] || continue
         report "INFO" "compromise:EVIDENCE_USER" "user:$id" \
             "login=$login email=$email registered=$reg - account created during/after exploit disclosure"
         evidence=$((evidence+1))
-    done < <(db_query "SELECT ID, user_login, user_email, user_registered FROM ${P}users WHERE user_registered >= '$EXPLOIT_WINDOW_START 00:00:00' ORDER BY ID DESC LIMIT 100;")
+    done < "$evuser"
 
     # 3) wp2shell PoC post markers: request/customize_changeset with 2020-01-01
     #    sentinel date, and oembed_cache spam posts in the window.
+    local evpost; evpost="$(rs_tmp compromise-evidence-post)"
+    db_query "SELECT ID, post_type, post_date, LEFT(post_title,40) FROM ${P}posts WHERE post_type IN ('request','customize_changeset') AND post_date='2020-01-01 00:00:00' LIMIT 100;" > "$evpost"
     while IFS=$'\t' read -r id ptype pdate title; do
         [ -n "$id" ] || continue
         report "INFO" "compromise:EVIDENCE_POST" "post:$id" \
             "type=$ptype date=$pdate title=$title - wp2shell PoC post marker"
         evidence=$((evidence+1))
-    done < <(db_query "SELECT ID, post_type, post_date, LEFT(post_title,40) FROM ${P}posts WHERE post_type IN ('request','customize_changeset') AND post_date='2020-01-01 00:00:00' LIMIT 100;")
+    done < "$evpost"
 
+    local evoembed; evoembed="$(rs_tmp compromise-evidence-oembed)"
+    db_query "SELECT ID, post_date, post_name FROM ${P}posts WHERE post_type='oembed_cache' AND post_date >= '$EXPLOIT_WINDOW_START 00:00:00' LIMIT 100;" > "$evoembed"
     while IFS=$'\t' read -r id pdate slug; do
         [ -n "$id" ] || continue
         report "INFO" "compromise:EVIDENCE_OEMBED" "post:$id" \
             "date=$pdate slug=$slug - oembed/spam post created in exploit window"
         evidence=$((evidence+1))
-    done < <(db_query "SELECT ID, post_date, post_name FROM ${P}posts WHERE post_type='oembed_cache' AND post_date >= '$EXPLOIT_WINDOW_START 00:00:00' LIMIT 100;")
+    done < "$evoembed"
 
     # 4) Known PoC attacker markers in post content.
+    local pocmarker; pocmarker="$(rs_tmp compromise-poc-marker)"
+    db_query "SELECT ID FROM ${P}posts WHERE post_content LIKE '%khadafigans%' OR post_content LIKE '%\"description\":\"proof\"%' LIMIT 50;" > "$pocmarker"
     while IFS=$'\t' read -r id; do
         [ -n "$id" ] || continue
         report "INFO" "compromise:POC_MARKER" "post:$id" \
             "content references a known wp2shell PoC marker (github.com/khadafigans / 'proof')"
         evidence=$((evidence+1))
-    done < <(db_query "SELECT ID FROM ${P}posts WHERE post_content LIKE '%khadafigans%' OR post_content LIKE '%\"description\":\"proof\"%' LIMIT 50;")
+    done < "$pocmarker"
 
     # 4b) ORPHANED admin usermeta: capability/user_level rows whose user no longer
     #     exists = a created-then-deleted privileged account (deleted-account ghost).
+    local orphanmeta; orphanmeta="$(rs_tmp compromise-orphaned-usermeta)"
+    db_query "SELECT m.umeta_id, m.user_id, m.meta_key FROM ${P}usermeta m LEFT JOIN ${P}users u ON u.ID=m.user_id WHERE u.ID IS NULL AND (m.meta_key='${P}capabilities' OR m.meta_key='${P}user_level') AND (m.meta_value LIKE '%administrator%' OR m.meta_value='10') LIMIT 100;" > "$orphanmeta"
     while IFS=$'\t' read -r umid uid mkey; do
         [ -n "$umid" ] || continue
         report "INFO" "compromise:ORPHANED_USERMETA" "usermeta:$umid" \
             "orphaned admin meta (user_id=$uid key=$mkey) - a privileged account was created then deleted"
         evidence=$((evidence+1))
-    done < <(db_query "SELECT m.umeta_id, m.user_id, m.meta_key FROM ${P}usermeta m LEFT JOIN ${P}users u ON u.ID=m.user_id WHERE u.ID IS NULL AND (m.meta_key='${P}capabilities' OR m.meta_key='${P}user_level') AND (m.meta_value LIKE '%administrator%' OR m.meta_value='10') LIMIT 100;")
+    done < "$orphanmeta"
 
     # 4c) Suspicious admin logins/emails (wpenginebot-style impersonation, bot names).
+    local suspadmin; suspadmin="$(rs_tmp compromise-suspicious-admin)"
+    db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' WHERE m.meta_value LIKE '%administrator%' AND (u.user_login REGEXP '(bot|hidden|admin[0-9]|wpengine|hacker|shell)' OR u.user_email REGEXP '(wpenginebot|hidden|[0-9a-f]{12}@)') LIMIT 50;" > "$suspadmin"
     while IFS=$'\t' read -r id login email reg; do
         [ -n "$id" ] || continue
         report "INFO" "compromise:SUSPICIOUS_ADMIN" "user:$id" \
             "login=$login email=$email registered=$reg - suspicious admin name/email pattern"
         evidence=$((evidence+1))
-    done < <(db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' WHERE m.meta_value LIKE '%administrator%' AND (u.user_login REGEXP '(bot|hidden|admin[0-9]|wpengine|hacker|shell)' OR u.user_email REGEXP '(wpenginebot|hidden|[0-9a-f]{12}@)') LIMIT 50;")
+    done < "$suspadmin"
 
     # 5) PHP files written to the webroot during the exploit window (dropped shells
     #    the attacker forgot to timestomp). Uses mtime, best-effort.
     local since_epoch
     since_epoch="$(date -d "$EXPLOIT_WINDOW_START" +%s 2>/dev/null || echo 0)"
     if [ "$since_epoch" -gt 0 ]; then
+        local filesinwindow; filesinwindow="$(rs_tmp compromise-files-in-window)"
+        find "$WPROOT/wp-content/uploads" "$WPROOT/wp-content/mu-plugins" -type f \
+             \( -name '*.php' -o -name '*.phtml' \) -newermt "$EXPLOIT_WINDOW_START" -print0 2>/dev/null \
+            | head -c 100000 > "$filesinwindow"
         while IFS= read -r -d '' f; do
             report "INFO" "compromise:FILE_IN_WINDOW" "${f#"$WPROOT"/}" \
                 "PHP file modified on/after $EXPLOIT_WINDOW_START - possible dropped payload"
             evidence=$((evidence+1))
-        done < <(find "$WPROOT/wp-content/uploads" "$WPROOT/wp-content/mu-plugins" -type f \
-                 \( -name '*.php' -o -name '*.phtml' \) -newermt "$EXPLOIT_WINDOW_START" -print0 2>/dev/null | head -c 100000)
+        done < "$filesinwindow"
     fi
 
     if [ "$evidence" -gt 0 ]; then
@@ -3099,47 +3275,47 @@ run_scan() {
     : > "$VERIFIED"
     load_signatures
     build_php_filelist
-    scan_core_vulns
-    scan_core_checksums
-    scan_core_orphans
-    scan_fake_plugins
-    scan_plugin_header_mismatch
-    scan_plugin_checksums
-    scan_wordfence_vulnerabilities
-    scan_vulnerable_plugins
-    scan_outdated_plugins
-    scan_mu_plugins
-    scan_xss_hidden_admin_paths
-    scan_rankmath_fake_core_file
-    scan_cache_php_files
-    scan_blockchain_js_loader
-    scan_wpconfig_content
-    scan_uploads_php
-    scan_asset_tampering
-    scan_exploit_upload_paths
-    scan_hashdb
-    scan_yara
-    scan_updraftcentral_grep_fallback
-    scan_updraftcentral_notice
-    scan_updraftcentral_variant2_grep_fallback
-    scan_rankmath_grep_fallback
-    scan_option_js_injector_grep_fallback
-    scan_rest_backdoor_grep_fallback
-    scan_secret_gated_exec_grep_fallback
-    scan_compress_zlib_grep_fallback
-    scan_heuristics
-    scan_nulled
-    scan_external_requests
-    scan_htaccess
-    scan_user_ini
-    scan_database
-    scan_updraftcentral_variant2_indicators
-    scan_rankmath_readonly_indicators
-    scan_malicious_options
-    scan_admin_exploit_correlation
-    scan_cve_artifacts
-    scan_compromise_indicators
-    scan_admin_session_review
+    rs_timed scan_core_vulns
+    rs_timed scan_core_checksums
+    rs_timed scan_core_orphans
+    rs_timed scan_fake_plugins
+    rs_timed scan_plugin_header_mismatch
+    rs_timed scan_plugin_checksums
+    rs_timed scan_wordfence_vulnerabilities
+    rs_timed scan_vulnerable_plugins
+    rs_timed scan_outdated_plugins
+    rs_timed scan_mu_plugins
+    rs_timed scan_xss_hidden_admin_paths
+    rs_timed scan_rankmath_fake_core_file
+    rs_timed scan_cache_php_files
+    rs_timed scan_blockchain_js_loader
+    rs_timed scan_wpconfig_content
+    rs_timed scan_uploads_php
+    rs_timed scan_asset_tampering
+    rs_timed scan_exploit_upload_paths
+    rs_timed scan_hashdb
+    rs_timed scan_yara
+    rs_timed scan_updraftcentral_grep_fallback
+    rs_timed scan_updraftcentral_notice
+    rs_timed scan_updraftcentral_variant2_grep_fallback
+    rs_timed scan_rankmath_grep_fallback
+    rs_timed scan_option_js_injector_grep_fallback
+    rs_timed scan_rest_backdoor_grep_fallback
+    rs_timed scan_secret_gated_exec_grep_fallback
+    rs_timed scan_compress_zlib_grep_fallback
+    rs_timed scan_heuristics
+    rs_timed scan_nulled
+    rs_timed scan_external_requests
+    rs_timed scan_htaccess
+    rs_timed scan_user_ini
+    rs_timed scan_database
+    rs_timed scan_updraftcentral_variant2_indicators
+    rs_timed scan_rankmath_readonly_indicators
+    rs_timed scan_malicious_options
+    rs_timed scan_admin_exploit_correlation
+    rs_timed scan_cve_artifacts
+    rs_timed scan_compromise_indicators
+    rs_timed scan_admin_session_review
     rm -f "$PHPLIST"
     finalize_report
     wordfence_write_attribution
@@ -3147,18 +3323,30 @@ run_scan() {
     # ------- summary -------
     say ""
     say "==================== SCAN SUMMARY ===================="
-    local high med infoc
+    local high med infoc incomplete
     high="$(awk -F'\t' '$1=="HIGH"'  "$REPORT" | wc -l)"
     med="$(awk  -F'\t' '$1=="MED"'   "$REPORT" | wc -l)"
     infoc="$(awk -F'\t' '$1=="INFO"' "$REPORT" | wc -l)"
+    incomplete="$(awk -F'\t' '$2=="check-incomplete"' "$REPORT" | wc -l | tr -d ' ')"
     say "  HIGH findings : $high   (very likely malicious / integrity failures)"
     say "  MED  findings : $med   (suspicious - review before acting)"
     say "  INFO findings : $infoc   (context for your review)"
     say ""
+    # A check that could not run (empty/missing input, a failed producer -
+    # see check_incomplete) must never be read as "nothing to report": its
+    # files are UNVERIFIED, not clean. This line, and the VERDICT override
+    # below, are what stop a partial scan from ever presenting as a clean one.
+    if [ "$incomplete" -gt 0 ]; then
+        bad "SCAN INCOMPLETE: $incomplete check(s) could not run - see check-incomplete findings below; results are NOT a clean bill of health"
+        say ""
+    fi
     # VERDICT: a coarse read from HIGH counts alone, not a replacement for
     # actually reading the findings - 0 HIGH is CLEAN, 1-2 is SUSPICIOUS
-    # (worth a close look), 3+ is COMPROMISED (act on it).
-    if [ "$high" -ge 3 ]; then
+    # (worth a close look), 3+ is COMPROMISED (act on it). An incomplete scan
+    # can never read as CLEAN, no matter how few HIGH findings it collected.
+    if [ "$incomplete" -gt 0 ] && [ "$high" -lt 1 ]; then
+        warn "VERDICT: INCOMPLETE  (0 HIGH findings, but $incomplete check(s) did not run - re-run once fixed)"
+    elif [ "$high" -ge 3 ]; then
         bad "VERDICT: COMPROMISED  ($high HIGH finding(s))"
     elif [ "$high" -ge 1 ]; then
         warn "VERDICT: SUSPICIOUS  ($high HIGH finding(s))"
@@ -3236,8 +3424,11 @@ latest_report() {
 #    email addresses, IPv4/IPv6 addresses, WordPress login names -> placeholders
 redact_report() {
     local in="$1" out="$2"
-    local lit="$RS_CACHE/redact-literals.$$"
-    : > "$lit"
+    # $lit/$litsorted briefly hold DB_PASSWORD and the auth salts in plaintext
+    # (see below) - rs_tmp keeps them under $RS_CACHE (umask 077) and registers
+    # them with the rs_cleanup trap, so Ctrl+C mid-redaction can't leave them
+    # behind the way a plain "$$"-named temp file would.
+    local lit; lit="$(rs_tmp redact-literals)"
 
     # --- collect literal values to replace (mode<TAB>needle<TAB>replacement) ---
     # mode: u = replace anywhere, b = token-bounded, d = domain (case-insensitive, bounded)
@@ -3285,7 +3476,7 @@ redact_report() {
     done
 
     # longest needles first so e.g. the WP root wins over the home dir
-    local litsorted="$lit.sorted"
+    local litsorted; litsorted="$(rs_tmp redact-literals-sorted)"
     awk -F'\t' '{ print length($2) "\t" $0 }' "$lit" | sort -t"$(printf '\t')" -k1,1rn \
         | cut -f2- > "$litsorted"
 
@@ -3350,7 +3541,7 @@ share_report() {
     local rpt; rpt="$(latest_report)"
     [ -n "$rpt" ] || { warn "No report found - run a scan first (option 1 or: ./ratsweepr.sh scan)."; return 1; }
     local shared="${rpt%.report}.shared.report"
-    local tmp="$RS_CACHE/shared-preview.$$"
+    local tmp; tmp="$(rs_tmp shared-preview)"
     info "Preparing a redacted copy of: $rpt"
     redact_report "$rpt" "$tmp" || { rm -f "$tmp"; warn "Redaction failed - nothing created."; return 1; }
     say ""
