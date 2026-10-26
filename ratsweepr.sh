@@ -41,7 +41,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.25-free"
+RS_VERSION="2.9.26-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -285,14 +285,12 @@ preflight() {
         die "Refusing to run as root. Run as the site user (RS_ALLOW_ROOT=1 to override)."
     fi
 
-    # Must be executed from a WordPress root.
-    WPROOT="$(pwd)"
-    [ -f "$WPROOT/wp-config.php" ] || die "No wp-config.php here. cd into the WordPress root first."
-    [ -f "$WPROOT/wp-includes/version.php" ] || die "wp-includes/version.php missing. Not a WordPress root?"
-
-    WPVER="$(grep -E "\\\$wp_version\s*=" "$WPROOT/wp-includes/version.php" \
-             | grep -Eo "([0-9]+\.)+[0-9]+" | head -1)"
-    [ -n "$WPVER" ] || die "Could not determine the WordPress version."
+    # scan-all (RATSWEEPR-008/R3) operates across multiple roots and has no
+    # single WPROOT of its own - require_wp_root() below is called explicitly
+    # by every per-site command instead of unconditionally here. Default to
+    # empty (not unset, since set -u is on) so setup_report_paths' WPROOT
+    # comparisons don't accidentally match every path via a bare "/*" glob.
+    WPROOT=""
 
     # Locate WP-CLI (optional but recommended). We never auto-install silently.
     WPCLI=""
@@ -311,6 +309,20 @@ preflight() {
     # (including masked secrets) inside the public web root.
 }
 
+# require_wp_root: the "must be a WordPress root" half of what preflight()
+# used to do unconditionally (RATSWEEPR-008/R3) - split out so scan-all can
+# run from outside any single site's root and chdir into each one itself.
+# Called explicitly by every per-site command.
+require_wp_root() {
+    WPROOT="$(pwd)"
+    [ -f "$WPROOT/wp-config.php" ] || die "No wp-config.php here. cd into the WordPress root first."
+    [ -f "$WPROOT/wp-includes/version.php" ] || die "wp-includes/version.php missing. Not a WordPress root?"
+
+    WPVER="$(grep -E "\\\$wp_version\s*=" "$WPROOT/wp-includes/version.php" \
+             | grep -Eo "([0-9]+\.)+[0-9]+" | head -1)"
+    [ -n "$WPVER" ] || die "Could not determine the WordPress version."
+}
+
 # setup_report_paths: default report location is $HOME/ratsweepr-reports
 # (RATSWEEPR-007/R5), not the scanned web root and not the CWD - a .report
 # file sitting in the web root is publicly fetchable by anyone who guesses
@@ -321,7 +333,7 @@ preflight() {
 # root right now.
 setup_report_paths() {
     RS_REPORT_DIR="${RS_REPORT_DIR_OVERRIDE:-${RS_REPORT_DIR:-$HOME/ratsweepr-reports}}"
-    if [ -n "${RS_REPORT_DIR_OVERRIDE:-}" ]; then
+    if [ -n "${RS_REPORT_DIR_OVERRIDE:-}" ] && [ -n "${WPROOT:-}" ]; then
         case "$RS_REPORT_DIR" in
             "$WPROOT"|"$WPROOT"/*)
                 warn "--report-dir '$RS_REPORT_DIR' is INSIDE the scanned web root - report files would be publicly reachable over HTTP. Choose a directory outside the web root (continuing anyway, as asked)."
@@ -334,6 +346,10 @@ setup_report_paths() {
     : > "$REPORT" 2>/dev/null; chmod 600 "$REPORT" 2>/dev/null
 
     RS_KIT_DIR="$(cd "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
+    # WPROOT is empty for commands with no single site of their own
+    # (scan-all, RATSWEEPR-008/R3) - skip the per-root exposure checks below;
+    # each site scan-all invokes does its own via its own require_wp_root.
+    [ -n "${WPROOT:-}" ] || return 0
     local exposed=0
     if [ -n "$RS_KIT_DIR" ]; then
         case "$RS_KIT_DIR" in
@@ -447,6 +463,13 @@ OPTION|gpltokenid
 OPTION|rg_gforms_key
 OPTION|fusion_registration_data
 OPTION|monsterinsights_license
+#
+# --- stale login-helper usermeta (RATSWEEPR-008/R5, STALETOKEN|name|meta_key-pattern,
+#     shell glob syntax against the meta_key) - a leftover one-time/magic-login
+#     token nobody uses any more; MED (remove if unused), not HIGH on its own ---
+STALETOKEN|one_time_login_token|one_time_login_token
+STALETOKEN|wp_simple_login_token|_wpsl_*_token
+STALETOKEN|magic_login_token|magic_login_*
 #
 # --- known-vulnerable WordPress core versions (CORE_VULN|label|min|max|fixed|note) ---
 # max is INCLUSIVE. Version compare is dotted-numeric. Update via signed feed.
@@ -922,6 +945,60 @@ scan_fake_plugins() {
                 "plugin ships a file literally named payload.php - almost always a malware dropper; verify manually (cleanup: RatSweepr Cleanup Kit / Done-For-You at ratsweepr.com)"
         fi
     done
+}
+
+# scan_login_helpers (RATSWEEPR-008/R5): a leftover one-time/magic-login
+# helper (often installed by a previous host's support team, then forgotten)
+# is a real unused attack surface but not itself evidence of compromise - MED,
+# "remove if you don't use it", not HIGH unless it correlates with an incident
+# (left to the caller/report reader; this check only locates the plugin).
+scan_login_helpers() {
+    info "Checking for leftover one-time/magic-login helper plugins..."
+    [ -d "$WPROOT/wp-content/plugins" ] || [ -d "$WPROOT/wp-content/mu-plugins" ] || return
+    local filelist; filelist="$(rs_tmp login-helper-files)"
+    find "$WPROOT/wp-content/plugins" "$WPROOT/wp-content/mu-plugins" \
+         -maxdepth 2 -type f -name '*.php' -print0 2>/dev/null > "$filelist"
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        if grep -qiE '(one.time.login|magic.login|auto.?login)' "$f" 2>/dev/null \
+           && grep -qiE '^[[:space:]]*\*?[[:space:]]*(Plugin Name|Description)[[:space:]]*:' "$f" 2>/dev/null; then
+            report "MED" "login-helper-plugin" "$rel" \
+                "plugin header/description references one-time/magic/auto login - unused login path, remove if you don't use it"
+        elif grep -qE 'wp_set_auth_cookie[[:space:]]*\(' "$f" 2>/dev/null \
+             && grep -qE '\$_(GET|REQUEST)\[' "$f" 2>/dev/null \
+             && grep -qiE "add_action[[:space:]]*\([[:space:]]*['\"](login_init|template_redirect)['\"]" "$f" 2>/dev/null; then
+            report "MED" "login-helper-plugin" "$rel" \
+                "sets the auth cookie from a token in the query string on a login-page hook - unused login path, remove if you don't use it"
+        fi
+    done < "$filelist"
+    ok "Login-helper check done."
+}
+
+# scan_stale_login_tokens (RATSWEEPR-008/R5): usermeta rows naming a
+# one-time/magic-login token, per the STALETOKEN entries in patterns.conf
+# (name|meta_key-glob - easy to extend without touching this function). MED,
+# not HIGH, unless it correlates with an incident window or an unexpected user.
+scan_stale_login_tokens() {
+    _rs_db_scan_allowed || return
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    local type name glob sqlglob
+    local rows; rows="$(rs_tmp staletoken-rows)"
+    while IFS='|' read -r type name glob; do
+        [ "$type" = "STALETOKEN" ] || continue
+        sqlglob="$(printf '%s' "$glob" | sed 's/\*/%/g')"
+        db_query "SELECT umeta_id, user_id, meta_key FROM ${P}usermeta WHERE meta_key LIKE '$sqlglob' LIMIT 200;" > "$rows"
+        local umid uid mkey
+        while IFS=$'\t' read -r umid uid mkey; do
+            [ -n "$umid" ] || continue
+            report "MED" "stale-login-token" "usermeta:$umid" \
+                "leftover '$name' token (user_id=$uid, meta_key=$mkey) - unused login path; remove with: wp user meta delete $uid $mkey"
+        done < "$rows"
+    done < "$PATTERNS_FILE"
+    ok "Stale login-token check done."
 }
 
 # scan_plugin_header_mismatch: a plugin's own declared header metadata can out a
@@ -3006,7 +3083,18 @@ db_query() { # db_query "SQL"  -> tab-separated rows on stdout
     fi
 }
 
+# _rs_db_scan_allowed -> 1 (skip) when scan-all (RATSWEEPR-008/R3/R4) already
+# scanned this exact database under a different site root in the same group -
+# every DB-touching scanner checks this first so a shared-database preview
+# copy never scans (or reports, or risks a cleanup action on) the same rows
+# twice. Unset/0 for a normal standalone `scan` - only scan-all's orchestrator
+# sets RS_SKIP_DB_SCAN=1 for the non-first member of a shared-DB group.
+_rs_db_scan_allowed() {
+    [ "${RS_SKIP_DB_SCAN:-0}" != "1" ]
+}
+
 scan_database() {
+    _rs_db_scan_allowed || return
     info "Scanning database (posts, options, users, cron)..."
     DB_NAME="$(wpconfig_val DB_NAME)"; DB_USER="$(wpconfig_val DB_USER)"
     DB_PASSWORD="$(wpconfig_val DB_PASSWORD)"; DB_HOST="$(wpconfig_val DB_HOST)"
@@ -3093,14 +3181,10 @@ scan_database() {
         done
     fi
 
-    # 6. administrator accounts - eyeball every one of these
-    db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered
-              FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID
-              WHERE m.meta_key='${P}capabilities' AND m.meta_value LIKE '%administrator%';" \
-    | while IFS=$'\t' read -r id login email reg; do
-        [ -n "$id" ] || continue
-        report "INFO" "db-admin-user" "user:$id" "admin '$login' <$email> registered $reg  <- do you recognize this account?"
-    done
+    # 6. administrator accounts: superseded by the dedicated scan_users()
+    #    triage (RATSWEEPR-008/R1), which reports every elevated-role account
+    #    (as db-admin-user INFO, or user-suspicious/user-hidden when flagged)
+    #    with far more context than a bare listing - not duplicated here.
 
     # 7. cron blob with suspicious content
     if db_query "SELECT option_value FROM ${P}options WHERE option_name='cron';" \
@@ -3120,6 +3204,7 @@ scan_database() {
 # stored injection, through the shared structural detector in
 # rs_loader_count_signals (see its header comment for the four signals).
 scan_db_loader_injection() {
+    _rs_db_scan_allowed || return
     [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
     local P="${DBPREFIX:-wp_}"
     db_query "SELECT 1" | grep -q 1 || return
@@ -3209,6 +3294,7 @@ _rs_report_db_loader_hit() { # _rs_report_db_loader_hit LOCATION LOCINFO ROWFILE
 # option; this finds which one). Detection-only (free): no cleanup action -
 # the paid Cleanup Kit exports then deletes these rows via quarantine-db.
 scan_malicious_options() {
+    _rs_db_scan_allowed || return
     [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
     local P="${DBPREFIX:-wp_}"
 
@@ -3266,6 +3352,7 @@ scan_malicious_options() {
 # the earliest changeset date is reported as the likely real compromise date
 # instead of whatever window the rest of the scan assumed.
 scan_admin_exploit_correlation() {
+    _rs_db_scan_allowed || return
     [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
     local P="${DBPREFIX:-wp_}"
     db_query "SELECT 1" | grep -q 1 || return
@@ -3328,6 +3415,211 @@ scan_admin_exploit_correlation() {
     fi
 }
 
+# _rs_days_between D1 D2 -> integer days (D2 - D1), or empty if either date
+# fails to parse. Tries GNU `date -d` first, then BSD/macOS `date -j -f`
+# against both a full timestamp and a bare date, so it works on both.
+_rs_days_between() {
+    local d1="$1" d2="$2" e1="" e2=""
+    e1="$(date -d "$d1" +%s 2>/dev/null)"
+    [ -n "$e1" ] || e1="$(date -j -f '%Y-%m-%d %H:%M:%S' "$d1" +%s 2>/dev/null)"
+    [ -n "$e1" ] || e1="$(date -j -f '%Y-%m-%d' "${d1%% *}" +%s 2>/dev/null)"
+    e2="$(date -d "$d2" +%s 2>/dev/null)"
+    [ -n "$e2" ] || e2="$(date -j -f '%Y-%m-%d %H:%M:%S' "$d2" +%s 2>/dev/null)"
+    [ -n "$e2" ] || e2="$(date -j -f '%Y-%m-%d' "${d2%% *}" +%s 2>/dev/null)"
+    [ -n "$e1" ] && [ -n "$e2" ] || return 1
+    echo $(( (e2 - e1) / 86400 ))
+}
+
+# _rs_earliest_injection_date -> MIN(post_modified) among posts that already
+# triggered db-loader-injection/db-post-injection THIS run, or empty if none.
+# Read from this scan's own $REPORT, not a hard-coded CVE-disclosure guess
+# (RATSWEEPR-008/R1 - "the earliest injection finding in the same scan").
+_rs_earliest_injection_date() {
+    local P="${DBPREFIX:-wp_}" idlist
+    idlist="$(awk -F'\t' '$2=="db-loader-injection" || $2=="db-post-injection" {
+        item=$3; sub(/^post(-excerpt)?:/,"",item); sub(/ .*/,"",item)
+        if (item ~ /^[0-9]+$/) print item
+    }' "$REPORT" 2>/dev/null | sort -un | tr '\n' ',' | sed 's/,$//')"
+    [ -n "$idlist" ] || return 1
+    db_query "SELECT MIN(post_modified) FROM ${P}posts WHERE ID IN ($idlist);" | head -1
+}
+
+# _rs_user_is_known LOGIN EMAIL -> 0 if listed in ~/.ratsweepr/known-users.conf
+# or --known-user/--known-domain (RATSWEEPR-008/R1). Matching users are shown
+# as INFO "known (by config)" and never run through the suspicion signals.
+_rs_user_is_known() {
+    local login="$1" email="$2" emaildom u k
+    emaildom="${email#*@}"
+    for u in "${KNOWN_USERS[@]:-}"; do
+        [ -n "$u" ] || continue
+        case "$u" in "$login"|"$email") return 0 ;; esac
+    done
+    for u in "${KNOWN_DOMAINS[@]:-}"; do
+        [ -n "$u" ] || continue
+        [ "$emaildom" = "$u" ] && return 0
+    done
+    [ -f "$RS_HOME/known-users.conf" ] || return 1
+    while IFS= read -r k; do
+        case "$k" in \#*|"") continue ;; esac
+        case "$k" in "$login"|"$email") return 0 ;; esac
+        case "$k" in DOMAIN:*) [ "$emaildom" = "${k#DOMAIN:}" ] && return 0 ;; esac
+    done < "$RS_HOME/known-users.conf"
+    return 1
+}
+
+# _rs_print_user_verification_commands ID LOGIN -> read-only copy-paste
+# commands to hand-verify a flagged user, printed via notice() (advisory
+# only, never written to $REPORT) and clearly NOT run by the scanner itself.
+_rs_print_user_verification_commands() {
+    local id="$1" login="$2"
+    notice "  Verify user:$id ($login) by hand before acting on it - NOT run by the scanner:"
+    notice "    wp post list --post_type=any --author=$id"
+    notice "    wp user meta get $id ${DBPREFIX:-wp_}capabilities"
+    notice "    wp user delete $id --reassign=<KNOWN_ADMIN_ID>   # only after you've verified it's rogue"
+}
+
+# scan_users (RATSWEEPR-008/R1): triage every elevated-role account (reading
+# the users/usermeta tables DIRECTLY, not `wp user list`, so a plugin
+# filtering pre_user_query can't hide a row from this check - see the
+# user-hidden comparison below), and flag the classic persistence-account
+# shape: a generated-looking login, an own-domain email that's just a copy of
+# the login, registered inside the incident window with no content, and
+# zero recorded logins. Any TWO of those -> user-suspicious (HIGH when it
+# correlates with an actual injection finding or window, MED otherwise).
+# Read-only throughout: never creates, deletes or modifies a user.
+scan_users() {
+    _rs_db_scan_allowed || return
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    info "Reviewing elevated-role user accounts..."
+
+    local siteurl sitedomain
+    siteurl="$(db_query "SELECT option_value FROM ${P}options WHERE option_name='siteurl';" | head -1)"
+    sitedomain="$(printf '%s' "$siteurl" | sed -E 's#^https?://##; s#[/:].*##')"
+    local injdate; injdate="$(_rs_earliest_injection_date)"
+
+    if [ -f "$RS_HOME/known-users.conf" ]; then
+        info "known-users.conf: $(grep -cvE '^[[:space:]]*(#|$)' "$RS_HOME/known-users.conf" 2>/dev/null || echo 0) entr(y/ies) loaded (not logged)"
+    fi
+
+    local rows; rows="$(rs_tmp users-elevated)"
+    db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered, m.meta_value
+              FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID
+              WHERE m.meta_key='${P}capabilities'
+                AND (m.meta_value LIKE '%administrator%' OR m.meta_value LIKE '%manage_options%'
+                     OR m.meta_value LIKE '%create_users%' OR m.meta_value LIKE '%edit_plugins%')
+              LIMIT 500;" > "$rows"
+
+    local id login email reg caps
+    while IFS=$'\t' read -r id login email reg caps; do
+        [ -n "$id" ] || continue
+        _rs_report_user_triage "$id" "$login" "$email" "$reg" "$caps" "$sitedomain" "$injdate" "$P"
+    done < "$rows"
+
+    # Hidden-admin check: a row present in ${P}users but ABSENT from `wp user
+    # list` (which runs through WP_User_Query, filterable by pre_user_query)
+    # is actively hidden from the admin UI - a strong backdoor signal on its
+    # own, regardless of role/capabilities.
+    if [ -n "$WPCLI" ]; then
+        local alllist; alllist="$(rs_tmp users-all-table)"
+        db_query "SELECT ID FROM ${P}users;" | sort -un > "$alllist"
+        local wplist; wplist="$(rs_tmp users-wpcli-list)"
+        $WPCLI user list --field=ID 2>/dev/null | sort -un > "$wplist"
+        if [ -s "$wplist" ] && [ -s "$alllist" ]; then
+            local hiddenlist; hiddenlist="$(rs_tmp users-hidden)"
+            comm -23 "$alllist" "$wplist" > "$hiddenlist" 2>/dev/null
+            local hid hinfofile hlogin hemail
+            while IFS= read -r hid; do
+                [ -n "$hid" ] || continue
+                hinfofile="$(rs_tmp user-hidden-info)"
+                db_query "SELECT user_login, user_email FROM ${P}users WHERE ID=$hid;" | head -1 > "$hinfofile"
+                IFS=$'\t' read -r hlogin hemail < "$hinfofile"
+                report "HIGH" "user-hidden" "user:$hid" \
+                    "login=$hlogin email=$hemail is present in the ${P}users table but absent from 'wp user list' - a plugin filtering pre_user_query (or similar) is hiding this account from the admin UI; verify by hand before any action"
+            done < "$hiddenlist"
+        fi
+    fi
+    ok "User triage done."
+}
+_rs_report_user_triage() { # _rs_report_user_triage ID LOGIN EMAIL REGISTERED CAPS SITEDOMAIN INJDATE PREFIX
+    local id="$1" login="$2" email="$3" reg="$4" caps="$5" sitedomain="$6" injdate="$7" P="$8"
+
+    if _rs_user_is_known "$login" "$email"; then
+        report "INFO" "user-known" "user:$id" "login=$login email=$email - known (by config)"
+        return
+    fi
+
+    local role="custom (elevated capability)"
+    case "$caps" in *administrator*) role="administrator" ;; esac
+
+    local postcount; postcount="$(db_query "SELECT COUNT(*) FROM ${P}posts WHERE post_author=$id AND post_status NOT IN ('auto-draft','trash');" | tr -d '[:space:]')"
+    case "$postcount" in ''|*[!0-9]*) postcount=0 ;; esac
+
+    # Last login: core session_tokens first (always available, no plugin
+    # needed), then a couple of well-known plugin meta keys as a fallback -
+    # never depends on exactly one source existing.
+    local lastlogin="never recorded" epoch="" logincount=0
+    local sess; sess="$(db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$id AND meta_key='session_tokens';" | head -1)"
+    if [ -n "$sess" ]; then
+        epoch="$(printf '%s' "$sess" | grep -oE '"login";i:[0-9]+;' | grep -oE '[0-9]+' | sort -rn | head -1)"
+    fi
+    if [ -z "$epoch" ]; then
+        local altfile; altfile="$(rs_tmp user-lastlogin)"
+        db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$id AND meta_key IN ('last_login','wordfence_lastLogin','wp_last_login') LIMIT 1;" > "$altfile"
+        local alt; alt="$(cat "$altfile" 2>/dev/null)"
+        [ -n "$alt" ] && epoch="$(printf '%s' "$alt" | grep -oE '[0-9]{9,}' | head -1)"
+    fi
+    if [ -n "$epoch" ]; then
+        lastlogin="$(date -r "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'epoch:%s' "$epoch")"
+        logincount=1
+    fi
+
+    local days="" dayssince="" daysinj=""
+    [ -n "${SINCE_DATE:-}" ] && dayssince="$(_rs_days_between "$SINCE_DATE" "$reg" 2>/dev/null)"
+    [ -n "$injdate" ] && daysinj="$(_rs_days_between "$injdate" "$reg" 2>/dev/null)"
+    [ -n "$daysinj" ] && days="$daysinj"
+    [ -z "$days" ] && [ -n "$dayssince" ] && days="$dayssince"
+
+    local daysnote=""
+    [ -n "$daysinj" ] && daysnote=", registered ${daysinj}d after the earliest injection finding ($injdate)"
+
+    local detail="login=$login email=$email registered=$reg role=$role posts=$postcount last_login=$lastlogin$daysnote"
+
+    # --- signals: any TWO trigger user-suspicious ---
+    local sig=0 reasons=""
+    if printf '%s' "$login" | grep -qE '^(administrator|admin|wpadmin|support|user)[_-]?[0-9a-f]{4,10}$' \
+       || printf '%s' "$login" | grep -qE '[0-9a-f]{6,}$'; then
+        sig=$((sig+1)); reasons="${reasons}generated-looking login; "
+    fi
+    local loginnorm emailnorm emaildomain
+    loginnorm="$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')"
+    emailnorm="$(printf '%s' "$email" | cut -d'@' -f1 | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')"
+    emaildomain="${email#*@}"
+    if [ -n "$sitedomain" ] && [ "$emaildomain" = "$sitedomain" ] \
+       && [ -n "$loginnorm" ] && [ "$loginnorm" = "$emailnorm" ]; then
+        sig=$((sig+1)); reasons="${reasons}email on the site's own domain, address is a copy of the login; "
+    fi
+    local inwindow=0
+    if [ "$postcount" = "0" ]; then
+        { [ -n "$dayssince" ] && [ "$dayssince" -ge 0 ] 2>/dev/null; } && inwindow=1
+        { [ -n "$daysinj" ]   && [ "$daysinj"   -ge 0 ] 2>/dev/null; } && inwindow=1
+    fi
+    [ "$inwindow" = "1" ] && { sig=$((sig+1)); reasons="${reasons}registered inside the incident window with zero posts; "; }
+    if [ "$role" = "administrator" ] && [ "$postcount" = "0" ] && [ "$logincount" = "0" ]; then
+        sig=$((sig+1)); reasons="${reasons}administrator with zero content and zero recorded logins; "
+    fi
+
+    if [ "$sig" -ge 2 ]; then
+        local sev="MED"
+        [ "$inwindow" = "1" ] && sev="HIGH"
+        report "$sev" "user-suspicious" "user:$id" "$detail -- ${reasons%; }"
+        _rs_print_user_verification_commands "$id" "$login"
+    else
+        report "INFO" "db-admin-user" "user:$id" "$detail"
+    fi
+}
+
 # scan_admin_session_review: read-only. For administrators already flagged as
 # suspicious by another check (admin-created-by-exploit, a suspicious-looking
 # admin name/email, or a user created in the exploit window), list every
@@ -3335,6 +3627,7 @@ scan_admin_exploit_correlation() {
 # serialized meta. Never destroys anything - this is detection-only (free);
 # the recommendation text points at the paid shuffle-salts workflow.
 scan_admin_session_review() {
+    _rs_db_scan_allowed || return
     [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
     local P="${DBPREFIX:-wp_}"
     local ids
@@ -3398,6 +3691,7 @@ scan_cve_artifacts() {
 }
 
 scan_compromise_indicators() {
+    _rs_db_scan_allowed || return
     # Post-exploitation evidence is version-INDEPENDENT: a site updated to a patched
     # version can still carry the attacker's users/posts/backdoors from when it WAS
     # vulnerable. So this ALWAYS runs. If a CVE matched we use its disclosure date;
@@ -3927,6 +4221,7 @@ run_scan() {
     rs_timed scan_core_checksums
     rs_timed scan_core_orphans
     rs_timed scan_fake_plugins
+    rs_timed scan_login_helpers
     rs_timed scan_plugin_header_mismatch
     rs_timed scan_plugin_checksums
     rs_timed scan_wordfence_vulnerabilities
@@ -3964,9 +4259,11 @@ run_scan() {
     rs_timed scan_updraftcentral_variant2_indicators
     rs_timed scan_rankmath_readonly_indicators
     rs_timed scan_malicious_options
+    rs_timed scan_stale_login_tokens
     rs_timed scan_admin_exploit_correlation
     rs_timed scan_cve_artifacts
     rs_timed scan_compromise_indicators
+    rs_timed scan_users
     rs_timed scan_admin_session_review
     rm -f "$PHPLIST"
     finalize_report
@@ -4014,6 +4311,7 @@ run_scan() {
             if (c=="db-loader-injection" || c=="plugin-analytics-module" || c=="fake-core-file" ||
                 c=="wp-config-injection" || c=="known-malware" || c=="php-in-uploads" ||
                 c=="compromise:ADMIN_CREATED_BY_EXPLOIT" || c=="compromise:CHANGESET_POC_PATTERN" ||
+                c=="user-hidden" || c=="user-suspicious" ||
                 c ~ /^yara:/ || c ~ /^heuristic:/) print
         }' "$REPORT" | wc -l | tr -d ' ')"
     local verdict_str=""
@@ -4052,6 +4350,7 @@ run_scan() {
                 if (c=="db-loader-injection" || c=="plugin-analytics-module" || c=="fake-core-file" ||
                     c=="wp-config-injection" || c=="known-malware" || c=="php-in-uploads" ||
                     c=="compromise:ADMIN_CREATED_BY_EXPLOIT" || c=="compromise:CHANGESET_POC_PATTERN" ||
+                    c=="user-hidden" || c=="user-suspicious" ||
                     c ~ /^yara:/ || c ~ /^heuristic:/) next
                 printf "  %-28s %s\n", c, $3
             }' "$REPORT"
@@ -4281,6 +4580,163 @@ help_report() {
     fi
 }
 
+# _rs_wpconfig_fingerprint WPCONFIG_PATH -> "DB_HOST|DB_NAME|table_prefix",
+# parsed as TEXT (never executes wp-config.php) - RATSWEEPR-008/R4. Falls
+# back to `wp config get` (run from that site's own directory) only when the
+# text parse can't find all three fields.
+_rs_wpconfig_fingerprint() {
+    local wc="$1" dir host name prefix out
+    dir="$(dirname -- "$wc")"
+    host="$(grep -E "define\([[:space:]]*['\"]DB_HOST['\"]" "$wc" 2>/dev/null | head -1 \
+        | sed -E "s/.*DB_HOST['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+    name="$(grep -E "define\([[:space:]]*['\"]DB_NAME['\"]" "$wc" 2>/dev/null | head -1 \
+        | sed -E "s/.*DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+    prefix="$(grep -E '^[[:space:]]*\$table_prefix' "$wc" 2>/dev/null | head -1 \
+        | sed -E "s/.*=[[:space:]]*['\"]([^'\"]+)['\"].*/\1/")"
+    if { [ -z "$host" ] || [ -z "$name" ] || [ -z "$prefix" ]; } && have wp; then
+        out="$(cd "$dir" 2>/dev/null && wp config get --format=json 2>/dev/null)"
+        if [ -n "$out" ] && [ "${HAVE_PHP:-0}" = "1" ]; then
+            [ -z "$host" ]   && host="$(printf '%s' "$out" | php -r '$d=json_decode(stream_get_contents(STDIN),true); echo isset($d["DB_HOST"]) ? $d["DB_HOST"] : "";' 2>/dev/null)"
+            [ -z "$name" ]   && name="$(printf '%s' "$out" | php -r '$d=json_decode(stream_get_contents(STDIN),true); echo isset($d["DB_NAME"]) ? $d["DB_NAME"] : "";' 2>/dev/null)"
+            [ -z "$prefix" ] && prefix="$(printf '%s' "$out" | php -r '$d=json_decode(stream_get_contents(STDIN),true); echo isset($d["table_prefix"]) ? $d["table_prefix"] : "";' 2>/dev/null)"
+        fi
+    fi
+    prefix="${prefix:-wp_}"
+    printf '%s|%s|%s\n' "$host" "$name" "$prefix"
+}
+
+# _rs_print_table FILE -> prints a tab-separated FILE (header row included) as
+# fixed-width columns. No `column` dependency (not guaranteed on every shared
+# host); plain awk, works identically on GNU and BSD/macOS.
+_rs_print_table() {
+    awk -F'\t' '
+        { n[NR]=split($0, f, "\t"); for (i=1;i<=n[NR];i++) { line[NR,i]=f[i]; if (length(f[i])>w[i]) w[i]=length(f[i]) } ; rows=NR }
+        END {
+            for (r=1;r<=rows;r++) {
+                out=""
+                for (i=1;i<=n[r];i++) out = out sprintf("%-" w[i] "s  ", line[r,i])
+                print out
+            }
+        }' "$1"
+}
+
+# scan_all (RATSWEEPR-008/R3): discover every WordPress root under the given
+# globs (default: the common shared-hosting layouts), then run the normal
+# single-site `scan` on each sequentially as a child process - re-invoking
+# this same script rather than refactoring run_scan() into a reusable library
+# over multiple WPROOTs, which this script's heavy use of global state makes
+# far riskier. Groups sites by (DB_HOST, DB_NAME, table_prefix) first
+# (RATSWEEPR-008/R4): the database is scanned only once per group, and every
+# other site's report gets a pointer to the one that did instead of
+# re-scanning (and nearly re-cleaning) the same rows.
+scan_all() {
+    local globs=("$@")
+    [ "${#globs[@]}" -gt 0 ] || globs=("$HOME/public_html" "$HOME/domains/*/public_html" "$HOME/*/public_html" "$HOME/sites/*")
+    local kitscript; kitscript="$RS_KIT_DIR/$(basename -- "$0")"
+
+    say ""
+    say "RatSweepr multi-site scan"
+    say ""
+
+    local candlist; candlist="$(rs_tmp scanall-candidates)"
+    : > "$candlist"
+    local g d real
+    for g in "${globs[@]}"; do
+        for d in $g; do
+            [ -d "$d" ] || continue
+            [ -f "$d/wp-config.php" ] || continue
+            [ -f "$d/wp-includes/version.php" ] || continue
+            real="$(cd "$d" 2>/dev/null && pwd -P)"
+            [ -n "$real" ] || continue
+            case "$real" in
+                "$RS_KIT_DIR"|"$RS_KIT_DIR"/*) continue ;;
+                "$RS_REPORT_DIR"|"$RS_REPORT_DIR"/*) continue ;;
+                "$RS_CACHE"|"$RS_CACHE"/*) continue ;;
+            esac
+            printf '%s\n' "$real" >> "$candlist"
+        done
+    done
+    sort -u "$candlist" -o "$candlist" 2>/dev/null || { sort -u "$candlist" > "$candlist.sorted" && mv "$candlist.sorted" "$candlist"; }
+    local n; n="$(wc -l < "$candlist" | tr -d ' ')"
+    [ "$n" -gt 0 ] || die "No WordPress roots found (checked: ${globs[*]})."
+    info "Discovered $n WordPress root(s)."
+
+    local fpfile; fpfile="$(rs_tmp scanall-fingerprints)"
+    : > "$fpfile"
+    local root fp
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        fp="$(_rs_wpconfig_fingerprint "$root/wp-config.php")"
+        printf '%s\t%s\n' "$fp" "$root" >> "$fpfile"
+    done < "$candlist"
+
+    local groupkeys; groupkeys="$(rs_tmp scanall-groupkeys)"
+    cut -f1 "$fpfile" | sort -u > "$groupkeys"
+
+    local summary; summary="$RS_REPORT_DIR/scan-all-$RUNSTAMP.summary.tsv"
+    : > "$summary" 2>/dev/null; chmod 600 "$summary" 2>/dev/null
+    printf 'site\tversion\tverdict\tHIGH\tMED\tINFO\tincomplete\treport\n' >> "$summary"
+
+    local worst=0 key members first other
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        members="$(awk -F'\t' -v K="$key" '$1==K{print $2}' "$fpfile")"
+        first="$(printf '%s\n' "$members" | head -1)"
+        other="$(printf '%s\n' "$members" | tail -n +2)"
+        local root2 start end elapsed skipdb outlog reportfile
+        while IFS= read -r root2; do
+            [ -n "$root2" ] || continue
+            [ "$root2" = "$first" ] && skipdb=0 || skipdb=1
+            start="$(date +%s)"
+            outlog="$(rs_tmp scanall-child-out)"
+            ( cd "$root2" && RS_SKIP_DB_SCAN="$skipdb" "$kitscript" scan --report-dir "$RS_REPORT_DIR" < /dev/null ) > "$outlog" 2>&1
+            end="$(date +%s)"; elapsed=$((end - start))
+            reportfile="$(grep -oE 'Full report: .*' "$outlog" | tail -1 | sed -E 's/^Full report: //')"
+            if [ -z "$reportfile" ] || [ ! -f "$reportfile" ]; then
+                warn "scan-all: $root2 produced no report - see $outlog"
+                continue
+            fi
+            if [ -n "$other" ] && [ "$root2" = "$first" ]; then
+                printf 'INFO\tdb-shared\t-\tdatabase shared with: %s\n' \
+                    "$(printf '%s' "$other" | tr '\n' ',' | sed 's/,$//; s/,/, /g')" >> "$reportfile"
+            elif [ "$root2" != "$first" ]; then
+                printf 'INFO\tdb-shared\t-\t(same database, see %s)\n' "$first" >> "$reportfile"
+            fi
+            local sitehigh sitemed siteinfo siteinc siteverdict sitever
+            sitehigh="$(awk -F'\t' '$1=="HIGH"' "$reportfile" | wc -l | tr -d ' ')"
+            sitemed="$(awk -F'\t' '$1=="MED"' "$reportfile" | wc -l | tr -d ' ')"
+            siteinfo="$(awk -F'\t' '$1=="INFO"' "$reportfile" | wc -l | tr -d ' ')"
+            siteinc="$(awk -F'\t' '$2=="check-incomplete"' "$reportfile" | wc -l | tr -d ' ')"
+            siteverdict="$(awk -F'\t' '$2=="verdict"{print $4}' "$reportfile" | tail -1 | sed -E 's/^verdict=//')"
+            sitever="$(grep -oE 'WordPress: [0-9][0-9.]*' "$outlog" | head -1 | awk '{print $2}')"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$root2" "${sitever:-?}" "${siteverdict:-UNKNOWN}" "$sitehigh" "$sitemed" "$siteinfo" "$siteinc" "$reportfile" >> "$summary"
+            info "[scan-all] $root2 -> ${siteverdict:-UNKNOWN} (HIGH=$sitehigh MED=$sitemed INFO=$siteinfo) in ${elapsed}s"
+            case "$siteverdict" in
+                INCOMPLETE)  [ "$worst" -lt 3 ] && worst=3 ;;
+                COMPROMISED) [ "$worst" -lt 2 ] && worst=2 ;;
+                SUSPICIOUS)  [ "$worst" -lt 1 ] && worst=1 ;;
+            esac
+        done << EOF2
+$members
+EOF2
+    done < "$groupkeys"
+
+    say ""
+    say "==================== SCAN-ALL SUMMARY ===================="
+    _rs_print_table "$summary"
+    say "============================================================="
+    say "Summary table: $summary"
+    say ""
+    case "$worst" in
+        0) ok "Overall: every site is NO KNOWN MALWARE FOUND." ;;
+        1) warn "Overall: at least one site NEEDS REVIEW." ;;
+        2) bad "Overall: at least one site COMPROMISED." ;;
+        3) bad "Overall: at least one site SCAN INCOMPLETE - re-run once fixed." ;;
+    esac
+    exit "$worst"
+}
+
 # ================================ MENU / CLI ==================================
 
 usage() {
@@ -4291,6 +4747,15 @@ Usage (run from the WordPress root, where wp-config.php lives):
   ratsweepr.sh scan             full read-only scan -> report
   ratsweepr.sh scan --since 2026-07-01   also list DB content modified since a date
   ratsweepr.sh scan --report-dir DIR     write report to DIR (default: $HOME/ratsweepr-reports)
+  ratsweepr.sh scan --known-user LOGIN_OR_EMAIL   suppress user triage for this account (repeatable)
+  ratsweepr.sh scan --known-domain DOMAIN         suppress user triage for this email domain (repeatable)
+  ratsweepr.sh scan-all [ROOT_GLOB...]   scan every WordPress root found (default: common
+                                 shared-hosting layouts under $HOME); one report per
+                                 site plus a summary table in $HOME/ratsweepr-reports/.
+                                 Exit codes: 0 every site NO KNOWN MALWARE FOUND,
+                                 1 at least one NEEDS REVIEW, 2 at least one
+                                 COMPROMISED, 3 at least one SCAN INCOMPLETE
+                                 (INCOMPLETE takes priority over the others).
   ratsweepr.sh update-sigs      refresh rfxn hash DB + pattern file
   ratsweepr.sh share-report     make a redacted copy of the latest report (opt-in, nothing is uploaded)
   ratsweepr.sh wp-config-review review flagged wp-config.php lines (read-only, secrets masked)
@@ -4325,11 +4790,15 @@ main_menu() {
 
 SINCE_DATE=""
 RS_REPORT_DIR_OVERRIDE=""
+KNOWN_USERS=()
+KNOWN_DOMAINS=()
 cmd="${1:-menu}"; shift || true
 while [ $# -gt 0 ]; do
     case "$1" in
         --since) SINCE_DATE="${2:-}"; shift 2;;
         --report-dir) RS_REPORT_DIR_OVERRIDE="${2:-}"; shift 2;;
+        --known-user) KNOWN_USERS+=("${2:-}"); shift 2;;
+        --known-domain) KNOWN_DOMAINS+=("${2:-}"); shift 2;;
         *) set -- "$1" "${@:2}"; break;;
     esac
 done
@@ -4337,17 +4806,24 @@ done
 # Commands that don't need a WordPress root are handled before preflight, so
 # help and unknown/removed commands work from any directory.
 case "$cmd" in
-    menu|scan|update-sigs|share-report|wp-config-review|print-hash|help-report) ;;
+    menu|scan|scan-all|update-sigs|share-report|wp-config-review|print-hash|help-report) ;;
     help|-h|--help)  usage; exit 0;;
     *)               usage; die "Unknown command: $cmd (RatSweepr Free is read-only; cleanup commands are not included)";;
 esac
 
 preflight
+# scan-all (RATSWEEPR-008/R3) discovers and chdir's into its own roots - every
+# other command still needs to be run from inside a single WordPress root.
+case "$cmd" in
+    scan-all) : ;;
+    *) require_wp_root ;;
+esac
 setup_report_paths
 
 case "$cmd" in
     menu)            main_menu;;
     scan)            update_signatures; run_scan;;
+    scan-all)        update_signatures; scan_all "$@";;
     update-sigs)     update_signatures;;
     share-report)    share_report;;
     wp-config-review) wp_config_review;;
