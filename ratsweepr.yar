@@ -517,3 +517,33 @@ rule RS_cloaker_token_marker_MED {
     condition:
         any of them
 }
+
+rule RS_js_loader_injection_structural {
+    meta:
+        description = "Behavioral third-party loader: admin-bar/bot-timing evasion, a document.cookie 'already injected' gate, a hand-rolled base64 decoder, and/or dynamic <script> element injection - structural match (RATSWEEPR-007), not any single literal, so renamed functions/cookies/endpoints still match. Any ONE signal alone is common in legitimate analytics snippets (a GTM-style loader IS signal 4 alone) - two or more together is the tell."
+        severity = "HIGH"
+    strings:
+        $admin        = "wpadminbar" nocase
+        $newdate      = /new[ \t]*Date[ \t]*\(\)/ nocase
+        $datenow      = /Date\.now[ \t]*\(/ nocase
+        $forloop      = /for[ \t]*\(/
+        $whileloop    = /while[ \t]*\(/
+        $cookiegate   = /document\.cookie[ \t]*=[^\x00]{0,200}expires/ nocase
+        $b64alphabet  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        $fromcharcode = "fromCharCode" nocase
+        $createscript = /createElement\([^)]{0,40}script/ nocase
+        $appendchild  = "appendChild" nocase
+    condition:
+        // Encodes "at least 2 of the 4 behavioral signals" as an OR of every
+        // pairwise AND (6 pairs for 4 signals) - mathematically exact, but
+        // many " and "/" or "s, so native_yara()'s skip-regex bails on this
+        // rule; scan_js_loader_injection_grep_fallback is the real
+        // unconditional enforcement (see its header comment). A real YARA
+        // engine evaluates this rule correctly on its own.
+        (($admin and ($newdate or $datenow)) and ($forloop or $whileloop) and $cookiegate) or
+        (($admin and ($newdate or $datenow)) and ($forloop or $whileloop) and ($b64alphabet and $fromcharcode)) or
+        (($admin and ($newdate or $datenow)) and ($forloop or $whileloop) and ($createscript and $appendchild)) or
+        ($cookiegate and ($b64alphabet and $fromcharcode)) or
+        ($cookiegate and ($createscript and $appendchild)) or
+        (($b64alphabet and $fromcharcode) and ($createscript and $appendchild))
+}

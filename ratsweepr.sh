@@ -7,8 +7,9 @@
 #
 #  Design principles:
 #    * READ-ONLY     - scanning never deletes or modifies anything on the site.
-#                      The only files written are the scan report (in the WP
-#                      root, mode 600) and the signature cache (~/.ratsweepr).
+#                      The only files written are the scan report (default
+#                      $HOME/ratsweepr-reports, mode 600 - never the WP root,
+#                      see --report-dir) and the signature cache (~/.ratsweepr).
 #    * VERIFY        - integrity checks against wordpress.org checksum APIs
 #                      are the primary detector; signatures are secondary.
 #    * FREE FEEDS    - wordpress.org checksums API (free), rfxn/maldet MD5
@@ -25,6 +26,9 @@
 #    ./ratsweepr.sh scan             full read-only scan -> report
 #    ./ratsweepr.sh scan --since 2026-07-01   also list DB content
 #                                     modified since a date
+#    ./ratsweepr.sh scan --report-dir DIR    write report to DIR instead
+#                                     of the default $HOME/ratsweepr-reports
+#    ./ratsweepr.sh print-hash FILE  SHA-256 of FILE, for allowlist.conf
 #    ./ratsweepr.sh update-sigs      refresh rfxn hash DB + pattern file
 #    ./ratsweepr.sh share-report     make a REDACTED copy of the latest
 #                                     report to share for research (opt-in,
@@ -37,7 +41,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.24-free"
+RS_VERSION="2.9.25-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -152,6 +156,93 @@ rs_timed() {
     fi
 }
 
+# --------------------- behavioral loader-injection detector -------------------
+# Shared by scan_db_loader_injection (DB rows) and scan_js_loader_injection_grep_fallback
+# (files): a third-party-script loader injected into post/widget content or a
+# file is detected by STRUCTURE, not by any one literal string, so renamed
+# functions/cookies/endpoints still match. Flags when >=2 of 4 signals co-occur
+# inside one <script>...</script> block: (1) an admin-bar visibility guard
+# combined with a timing/loop check (skip logged-in admins and bots/slow
+# clients), (2) a document.cookie write with an expiry used as an
+# "already injected" gate, (3) a hand-rolled base64 decoder (the 65-char
+# alphabet literal + fromCharCode/charAt/indexOf), (4) dynamic
+# createElement('script')+.src=+appendChild into head/documentElement. Any ONE
+# of these alone is common in legitimate analytics snippets (Google Tag
+# Manager's loader is just signal 4) - requiring two is what keeps a stock GA/
+# Meta-pixel tag from ever matching.
+_rs_loader_flatten() { # _rs_loader_flatten SRCFILE -> path to a new flattened temp file
+    # Joins embedded newlines so a payload split/wrapped across multiple lines
+    # (or a real newline inside a DB text column) is still seen as one block.
+    local src="$1" flat
+    flat="$(rs_tmp loader-flat)"
+    tr '\n\r' '  ' < "$src" > "$flat" 2>/dev/null
+    printf '%s\n' "$flat"
+}
+rs_loader_count_signals() { # rs_loader_count_signals FLATFILE -> one line per qualifying <script> block: signal count (2-4)
+    awk '
+    {
+        n = split($0, parts, "</script>")
+        for (i = 1; i < n; i++) {
+            block = parts[i]
+            p = index(block, "<script")
+            if (p == 0) continue
+            rest = substr(block, p)
+            gt = index(rest, ">")
+            if (gt == 0) continue
+            body = substr(rest, gt + 1)
+
+            sig = 0
+            hasAdmin  = (body ~ /wpadminbar/)
+            hasTiming = ((body ~ /new[ \t]*Date[ \t]*\(\)/ || body ~ /Date\.now[ \t]*\(/) \
+                         && (body ~ /for[ \t]*\(/ || body ~ /while[ \t]*\(/))
+            if (hasAdmin && hasTiming) sig++
+
+            if (body ~ /document\.cookie[ \t]*=.*expires/) sig++
+
+            hasAlpha = (index(body, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") > 0) \
+                       && (body ~ /fromCharCode/) && (body ~ /charAt|indexOf/)
+            if (hasAlpha) sig++
+
+            hasDyn = (body ~ /createElement\([^)]{0,40}script/) \
+                     && (body ~ /\.src[ \t]*=/) && (body ~ /appendChild/) \
+                     && (body ~ /head|documentElement/)
+            if (hasDyn) sig++
+
+            if (sig >= 2) print sig
+        }
+    }' "$1"
+}
+rs_loader_extract_cookie() { # rs_loader_extract_cookie FLATFILE -> gate cookie name, or empty
+    grep -oE "document\.cookie[[:space:]]*=[[:space:]]*['\"][A-Za-z0-9_-]+=" "$1" 2>/dev/null \
+        | head -1 | sed -E "s/.*['\"]//; s/=\$//"
+}
+rs_loader_decode_url() { # rs_loader_decode_url FLATFILE -> decoded http(s) URL, or empty
+    # Decodes every base64-looking literal (len 20+) through a temp file, never
+    # a variable (never process substitution) - prefers php, falls back to
+    # base64 -d (GNU) / -D (BSD) / openssl base64, exactly the failover order
+    # the task that added this function was asked to use.
+    local litfile decfile lit
+    litfile="$(rs_tmp loader-b64lits)"
+    grep -oE '[A-Za-z0-9+/]{20,}={0,2}' "$1" 2>/dev/null | head -20 > "$litfile"
+    decfile="$(rs_tmp loader-decode)"
+    while IFS= read -r lit; do
+        [ -n "$lit" ] || continue
+        : > "$decfile"
+        if [ "${HAVE_PHP:-0}" = "1" ]; then
+            printf '%s' "$lit" | php -r 'echo base64_decode(stream_get_contents(STDIN), true);' > "$decfile" 2>/dev/null
+        fi
+        if [ ! -s "$decfile" ]; then
+            printf '%s' "$lit" | base64 -d > "$decfile" 2>/dev/null \
+                || printf '%s' "$lit" | base64 -D > "$decfile" 2>/dev/null \
+                || printf '%s' "$lit" | openssl base64 -d -A > "$decfile" 2>/dev/null
+        fi
+        if [ -s "$decfile" ] && LC_ALL=C grep -aqE '^https?://' "$decfile" 2>/dev/null; then
+            LC_ALL=C tr -d '\000' < "$decfile" | head -1
+            return
+        fi
+    done < "$litfile"
+}
+
 fetch() { # fetch URL OUTFILE  (curl or wget, whichever exists)
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -215,7 +306,50 @@ preflight() {
     EXPLOIT_LABEL=""
     MANIFEST_OK=0
     DBPREFIX=""
-    REPORT="$WPROOT/ratsweepr-$RUNSTAMP.report"
+    # REPORT is set later by setup_report_paths(), once --report-dir has been
+    # parsed - it used to live in $WPROOT itself, which put scan findings
+    # (including masked secrets) inside the public web root.
+}
+
+# setup_report_paths: default report location is $HOME/ratsweepr-reports
+# (RATSWEEPR-007/R5), not the scanned web root and not the CWD - a .report
+# file sitting in the web root is publicly fetchable by anyone who guesses
+# its name. --report-dir DIR / $RS_REPORT_DIR override it; an override that
+# still points inside the web root gets a loud warning rather than being
+# silently honored. Also warns (never moves/deletes anything) if the running
+# script or a report from a PREVIOUS run is itself sitting inside the web
+# root right now.
+setup_report_paths() {
+    RS_REPORT_DIR="${RS_REPORT_DIR_OVERRIDE:-${RS_REPORT_DIR:-$HOME/ratsweepr-reports}}"
+    if [ -n "${RS_REPORT_DIR_OVERRIDE:-}" ]; then
+        case "$RS_REPORT_DIR" in
+            "$WPROOT"|"$WPROOT"/*)
+                warn "--report-dir '$RS_REPORT_DIR' is INSIDE the scanned web root - report files would be publicly reachable over HTTP. Choose a directory outside the web root (continuing anyway, as asked)."
+                ;;
+        esac
+    fi
+    mkdir -p "$RS_REPORT_DIR" 2>/dev/null
+    chmod 700 "$RS_REPORT_DIR" 2>/dev/null
+    REPORT="$RS_REPORT_DIR/ratsweepr-$RUNSTAMP.report"
+    : > "$REPORT" 2>/dev/null; chmod 600 "$REPORT" 2>/dev/null
+
+    RS_KIT_DIR="$(cd "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
+    local exposed=0
+    if [ -n "$RS_KIT_DIR" ]; then
+        case "$RS_KIT_DIR" in
+            "$WPROOT"|"$WPROOT"/*)
+                warn "The scanner script ($0) is INSIDE the scanned web root and may be publicly reachable. Move the kit out of the web root."
+                exposed=1
+                ;;
+        esac
+    fi
+    local oldrpt; oldrpt="$(find "$WPROOT" -type f -name 'ratsweepr-*.report' 2>/dev/null)"
+    if [ -n "$oldrpt" ]; then
+        warn "Previous scan report(s) found INSIDE the scanned web root - these may be publicly reachable:"
+        printf '%s\n' "$oldrpt" | while IFS= read -r l; do warn "  $l"; done
+        exposed=1
+    fi
+    [ "$exposed" = "1" ] && warn "Nothing was moved or deleted automatically - move these out of the web root by hand."
 }
 
 banner() {
@@ -232,6 +366,19 @@ banner() {
 #   2. patterns.conf   - heuristic grep patterns + piracy domains + bad
 #                        wp_options keys. Bundled defaults below; you can host
 #                        an updated copy (PATTERN_URL) and sign it with openssl.
+
+# _rs_is_benign_vendored_hook FILE -> 0 if FILE only toggles a hook (both
+# add_action/add_filter AND the matching remove_action/remove_filter present)
+# and never writes to $wpdb or a *_users table (RATSWEEPR-007/R3). The real
+# "hide the admin account" pattern leaves the hook registered permanently and
+# performs an actual user-table write/filter; a vendored library that adds
+# then removes the same hook around one internal operation does neither.
+_rs_is_benign_vendored_hook() {
+    local f="$1"
+    grep -qE '\b(add_action|add_filter)[[:space:]]*\(' "$f" 2>/dev/null || return 1
+    grep -qE '\b(remove_action|remove_filter)[[:space:]]*\(' "$f" 2>/dev/null || return 1
+    ! grep -qiE '\$wpdb[[:space:]]*->[[:space:]]*(query|update|delete|insert)[[:space:]]*\(|UPDATE[[:space:]]+[^;]*users|DELETE[[:space:]]+FROM[[:space:]]+[^;]*users|INSERT[[:space:]]+INTO[[:space:]]+[^;]*users' "$f" 2>/dev/null
+}
 
 write_default_patterns() {
     # Bundled fallback so the scanner works offline out of the box.
@@ -337,6 +484,30 @@ EOSIG
     ok "Wrote bundled heuristic patterns -> $RS_SIG_DIR/patterns.conf"
 }
 
+write_default_allowlist() {
+    # Host-managed must-use plugins are downgraded from HIGH to INFO ONLY when
+    # their SHA-256 matches an entry here - never by filename alone, since an
+    # attacker can name a dropped file anything (RATSWEEPR-007/R3). Ships
+    # empty: no hash can be listed here without having verified it against a
+    # real file first ("never add a hash you can't justify"). Add your own
+    # host-confirmed entries, found with: ratsweepr.sh print-hash FILE
+    printf '# RatSweepr allowlist [bundled-version: %s]\n' "$RS_VERSION" \
+        > "$RS_SIG_DIR/allowlist.conf"
+    cat >> "$RS_SIG_DIR/allowlist.conf" << 'EOALLOW'
+# Lines:  ALLOWMU|path-glob|sha256|note
+#   path-glob - matched against the file's path relative to the WordPress
+#               root (e.g. wp-content/mu-plugins/*.php), shell glob syntax
+#   sha256    - the file's exact SHA-256 - get it with:
+#               ratsweepr.sh print-hash wp-content/mu-plugins/the-file.php
+#   note      - short, generic reason shown in the report (no host/vendor
+#               brand names - "host-managed mu-plugin", not a company name)
+#
+# No entries ship by default - see the header above. A name match with a
+# DIFFERENT hash always stays HIGH, even if a glob below matches its path.
+EOALLOW
+    ok "Wrote bundled allowlist -> $RS_SIG_DIR/allowlist.conf"
+}
+
 update_signatures() {
     info "Updating rfxn/maldet MD5 hash database..."
     local tmp="$RS_CACHE/rfxn.hdb.$$"
@@ -394,6 +565,49 @@ load_signatures() {
     fi
     PATTERNS_FILE="$RS_SIG_DIR/patterns.conf"
     HDB_FILE="$RS_SIG_DIR/rfxn.hdb"
+
+    local allow_bundled_ver=""
+    [ -f "$RS_SIG_DIR/allowlist.conf" ] && \
+        allow_bundled_ver="$(sed -n 's/.*\[bundled-version: \([^]]*\)\].*/\1/p' "$RS_SIG_DIR/allowlist.conf" | head -1)"
+    if [ ! -s "$RS_SIG_DIR/allowlist.conf" ] || [ "$allow_bundled_ver" != "$RS_VERSION" ]; then
+        write_default_allowlist
+    fi
+    ALLOWLIST_FILE="$RS_SIG_DIR/allowlist.conf"
+}
+
+# allowlist_hash_check REL SHA256 -> 0 on a path-glob+hash match in
+# allowlist.conf (ALLOWMU lines); sets ALLOWLIST_NOTE to its generic reason.
+allowlist_hash_check() {
+    local rel="$1" hash="$2" type glob want note
+    ALLOWLIST_NOTE=""
+    [ -s "${ALLOWLIST_FILE:-}" ] || return 1
+    while IFS='|' read -r type glob want note; do
+        [ "$type" = "ALLOWMU" ] || continue
+        case "$rel" in $glob) : ;; *) continue ;; esac
+        [ -n "$want" ] && [ "$hash" = "$want" ] || continue
+        ALLOWLIST_NOTE="$note"
+        return 0
+    done < "$ALLOWLIST_FILE"
+    return 1
+}
+
+print_hash() { # print_hash FILE -> sha256, with a ready-to-paste allowlist.conf line
+    local f="$1" rel hash
+    [ -f "$f" ] || die "No such file: $f"
+    hash="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    [ -n "$hash" ] || hash="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+    [ -n "$hash" ] || die "Could not compute a SHA-256 for $f (need sha256sum or shasum)."
+    case "$f" in
+        "$WPROOT"/*) rel="${f#"$WPROOT"/}" ;;
+        *) rel="$f" ;;
+    esac
+    say "SHA-256: $hash"
+    say ""
+    say "To allowlist this exact file as a host-managed mu-plugin, add a line"
+    say "like this to $RS_SIG_DIR/allowlist.conf :"
+    say "  ALLOWMU|$rel|$hash|host-managed mu-plugin"
+    say ""
+    say "Only add this if you have verified by hand that the file is legitimate."
 }
 
 # =============================== SCANNERS =====================================
@@ -403,7 +617,13 @@ load_signatures() {
 # NUL-safe.
 build_php_filelist() {
     PHPLIST="$RS_CACHE/philist.$$"
-    find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -prune \) -o \
+    # RS_KIT_DIR/RS_CACHE/RS_REPORT_DIR are pruned unconditionally - harmless
+    # no-ops when they're outside $WPROOT (the common case), and the actual
+    # fix when the kit happens to be run from inside the web root
+    # (RATSWEEPR-007/R5): without this, the kit's own bundled YARA/pattern
+    # files and cache would show up as findings in its own scan.
+    find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -o -path "$RS_KIT_DIR" \
+                       -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
          -type f \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' \
                     -o -name '*.suspected' -o -name '.*.ico' \) -print0 \
          > "$PHPLIST" 2>/dev/null
@@ -511,19 +731,50 @@ scan_core_orphans() {
 }
 
 scan_core_checksums() {
-    info "Verifying WordPress $WPVER core files against api.wordpress.org checksums..."
+    # Determine the SITE's own locale from wp-includes/version.php's
+    # $wp_local_package (empty on a plain en_US install, e.g. "es_MX" on a
+    # localized one). Fetching THAT locale's checksums is the real fix for
+    # the "version.php always shows core-modified" false positive: a
+    # localized install is rewritten at setup to carry its own
+    # $wp_local_package value, which never matches the en_US manifest, but
+    # DOES match the manifest wordpress.org publishes for that locale.
+    # CORE_LOCALE_FALLBACK=1 (set below) means no genuine per-locale manifest
+    # was available and we fell back to en_US - used later to gate a narrow,
+    # named INFO downgrade instead of silently losing real detections.
+    local site_locale
+    site_locale="$(grep -oE "wp_local_package[[:space:]]*=[[:space:]]*['\"][^'\"]*['\"]" \
+        "$WPROOT/wp-includes/version.php" 2>/dev/null | sed -E "s/.*['\"]([^'\"]*)['\"].*/\1/")"
+    [ -n "$site_locale" ] || site_locale="en_US"
+    CORE_LOCALE="$site_locale"
+    CORE_LOCALE_FALLBACK=0
+
+    info "Verifying WordPress $WPVER core files against api.wordpress.org checksums (locale: $CORE_LOCALE)..."
     if [ "$HAVE_PHP" != "1" ]; then
         warn "php-cli not found: skipping core checksum verification."
         report "WARN" "core" "-" "php missing, core checksums skipped"
         return
     fi
-    local js="$RS_CACHE/core-$WPVER.json"
+    local js="$RS_CACHE/core-$WPVER-$CORE_LOCALE.json"
     if [ ! -s "$js" ]; then
-        fetch "https://api.wordpress.org/core/checksums/1.0/?version=$WPVER&locale=en_US" "$js" \
-            || { check_incomplete "core-checksums" "could not download the checksum API response for $WPVER"; return; }
+        if ! fetch "https://api.wordpress.org/core/checksums/1.0/?version=$WPVER&locale=$CORE_LOCALE" "$js" \
+             || [ ! -s "$js" ]; then
+            rm -f "$js"
+            if [ "$CORE_LOCALE" != "en_US" ]; then
+                CORE_LOCALE_FALLBACK=1
+                js="$RS_CACHE/core-$WPVER-en_US.json"
+                if [ ! -s "$js" ]; then
+                    fetch "https://api.wordpress.org/core/checksums/1.0/?version=$WPVER&locale=en_US" "$js" \
+                        || { check_incomplete "core-checksums" "could not download the checksum API response for $WPVER (locale $CORE_LOCALE or en_US fallback)"; return; }
+                fi
+            else
+                check_incomplete "core-checksums" "could not download the checksum API response for $WPVER"
+                return
+            fi
+        fi
     fi
     [ -s "$js" ] || { check_incomplete "core-checksums" "checksum API response for $WPVER is missing or empty"; return; }
-    local manifest="$RS_CACHE/core-$WPVER.md5"
+    local manifest="$RS_CACHE/core-$WPVER-$CORE_LOCALE.md5"
+    [ "$CORE_LOCALE_FALLBACK" = "1" ] && manifest="$RS_CACHE/core-$WPVER-en_US-fallback.md5"
     php_json 'foreach($d["checksums"] as $f=>$m) echo $m."  ".$f."\n";' \
         < "$js" > "$manifest" 2>/dev/null
     if [ ! -s "$manifest" ]; then
@@ -554,7 +805,22 @@ scan_core_checksums() {
                     *) report "HIGH" "core-missing" "$f" "core file missing or unreadable";;
                 esac;;
             *": FAILED"*)
-                report "HIGH" "core-modified" "$f" "does not match official $WPVER checksum";;
+                # Locale-manifest mismatch, not tampering: no per-locale checksum
+                # manifest was available (CORE_LOCALE_FALLBACK=1, compared against
+                # en_US instead) on a site whose own locale isn't en_US, and this is
+                # one of the two files publicly confirmed to differ purely for that
+                # reason - wp-includes/version.php (rewrites $wp_local_package at
+                # install) and the bundled akismet/hello.php (coverage gaps in some
+                # locale/version manifests). Gated on the site genuinely being
+                # non-en_US (an attacker can't fake that without already having
+                # code-exec) rather than trusting the filename alone.
+                if [ "$CORE_LOCALE_FALLBACK" = "1" ] && [ "$CORE_LOCALE" != "en_US" ] \
+                   && { [ "$f" = "wp-includes/version.php" ] || [ "$f" = "wp-content/plugins/akismet/hello.php" ]; }; then
+                    report "INFO" "core-locale-mismatch" "$f" \
+                        "allowlisted: locale package line differs - no checksum manifest for locale '$CORE_LOCALE' was available, compared against en_US instead (site locale is $CORE_LOCALE); verify by hand if in doubt"
+                else
+                    report "HIGH" "core-modified" "$f" "does not match official $WPVER checksum"
+                fi;;
         esac
         fails=$((fails+1))
     done < "$md5out"
@@ -815,11 +1081,20 @@ scan_mu_plugins() {
     # here still goes through the YARA/heuristic content scan, so a tampered copy is
     # caught by content even though its name is allowlisted.
     local known="|kinsta-mu-plugins.php|index.php|wp-migrate-db-pro-compatibility.php|0-worker.php|wpengine-common.php|wpe-wp-sign-on-plugin.php|mu-plugin.php|slt-force-strong-passwords.php|"
-    local f base rel
+    local f base rel hash
     for f in "$mud"/*.php; do
         [ -f "$f" ] || continue
         base="$(basename "$f")"
         rel="${f#"$WPROOT"/}"
+        # Hash-verified allowlist (RATSWEEPR-007/R3): a host-managed mu-plugin
+        # is downgraded to INFO only when its SHA-256 matches allowlist.conf -
+        # a name match with a DIFFERENT hash (tampered copy) still falls
+        # through to the HIGH below.
+        hash="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+        if [ -n "$hash" ] && allowlist_hash_check "$rel" "$hash"; then
+            report "INFO" "mu-plugin-allowlisted" "$rel" "allowlisted: ${ALLOWLIST_NOTE:-host-managed mu-plugin} (SHA-256 verified)"
+            continue
+        fi
         case "$known" in *"|$base|"*) continue;; esac
         # allow anything already covered by an ALLOWPATH trusted-vendor prefix
         if allowpath_check "$rel"; then continue; fi
@@ -853,14 +1128,19 @@ wpconfig_flagged_lines() { # emits CATEGORY<TAB>LINENO<TAB>CODE for every flagge
         case "$lnum" in ''|*[!0-9]*) lnum="0" ;; esac
         printf 'wp-config-rogue-include\t%s\t%s\n' "$lnum" "$lcontent"
     done < "$wcrogue"
-    # injected eval/base64/exec constructs in wp-config
+    # injected eval/base64/exec constructs, and - per public advisories on the
+    # Essential Plugin family's wp-config.php search-engine-only spam
+    # injection (RATSWEEPR-007/R2) - a user-agent test (core's wp-config.php
+    # never inspects HTTP_USER_AGENT) or an outbound fetch/curl call. Any one
+    # of these outside the normal WordPress boilerplate is category
+    # wp-config-injection, HIGH.
     local wcinject; wcinject="$(rs_tmp wpconfig-inject)"
-    grep -nE 'eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|\$_(GET|POST|REQUEST|COOKIE)\[|assert\s*\(|create_function\s*\(' "$wc" 2>/dev/null > "$wcinject"
+    grep -nE 'eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|\$_(GET|POST|REQUEST|COOKIE)\[|assert\s*\(|create_function\s*\(|HTTP_USER_AGENT|Googlebot|file_get_contents\s*\(\s*"http|file_get_contents\s*\(\s*'"'"'http|curl_(init|exec|setopt)\s*\(' "$wc" 2>/dev/null > "$wcinject"
     while IFS= read -r raw; do
         [ -n "$raw" ] || continue
         lnum="${raw%%:*}"; lcontent="${raw#*:}"
         case "$lnum" in ''|*[!0-9]*) lnum="0" ;; esac
-        printf 'wp-config-injected-code\t%s\t%s\n' "$lnum" "$lcontent"
+        printf 'wp-config-injection\t%s\t%s\n' "$lnum" "$lcontent"
     done < "$wcinject"
 }
 
@@ -912,6 +1192,24 @@ EOF
     say "Then re-run: ratsweepr.sh scan"
 }
 
+# _rs_is_uploads_php_stub FILE -> 0 only if, with comments and whitespace
+# removed, FILE is nothing but "<?php" optionally followed by a bare
+# exit;/die;/return; (RATSWEEPR-007/R3) - judged purely on content, not on
+# the filename being "index.php": the field false-positives were also named
+# like uploads/<plugin>/cache/index.php and uploads/<plugin>-db/index.php,
+# and a content-only rule covers any of those shapes without needing to
+# special-case a name (which an attacker could trivially also use).
+_rs_is_uploads_php_stub() {
+    local f="$1" sz stripped
+    sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
+    [ "$sz" -le 220 ] 2>/dev/null || return 1
+    # strip // and # line comments, then /* */ block comments, then all whitespace
+    stripped="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
+        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
+        | tr -d '[:space:]')"
+    printf '%s' "$stripped" | grep -qE '^<\?php(exit(\(\))?;?|die(\(\))?;?|return;?)?$'
+}
+
 scan_uploads_php() {
     info "Scanning wp-content/uploads for PHP files (should contain none)..."
     [ -d "$WPROOT/wp-content/uploads" ] || return
@@ -920,13 +1218,8 @@ scan_uploads_php() {
          \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' \) -print0 > "$uplist"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
-        # Many legit plugins drop an empty "Silence is golden" index.php guard.
-        # Treat a small index.php with no real code as INFO, not HIGH.
-        local base; base="$(basename "$f")"
-        local sz; sz="$(wc -c < "$f" 2>/dev/null || echo 999)"
-        if [ "$base" = "index.php" ] && [ "$sz" -lt 200 ] \
-           && ! grep -qiE '\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)|eval|base64|system|exec|passthru|assert|include|require|fopen|file_put|curl' "$f" 2>/dev/null; then
-            report "INFO" "php-in-uploads" "$rel" "empty index.php silence-guard (benign) - no executable code"
+        if _rs_is_uploads_php_stub "$f"; then
+            report "INFO" "php-in-uploads" "$rel" "empty PHP stub (<?php + optional bare exit/die/return, <=220 bytes) - benign, no executable code"
         else
             report "HIGH" "php-in-uploads" "$rel" "executable PHP inside uploads - almost always malicious"
         fi
@@ -954,7 +1247,8 @@ scan_asset_tampering() {
     done
     local f rel sz magic head
     local assetlist; assetlist="$(rs_tmp asset-tampering)"
-    find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -prune \) -o \
+    find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -o -path "$RS_KIT_DIR" \
+                       -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
          -type f \( "${nameargs[@]}" \) -print0 2>/dev/null > "$assetlist"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
@@ -1033,6 +1327,52 @@ allowpath_check() {
         case "$rel" in "$pfx"/*|"$pfx") ALLOWPATH_URL="$url"; return 0;; esac
     done < "$PATTERNS_FILE"
     return 1
+}
+
+# _rs_extract_prepend_target LINE -> the path argument of an auto_prepend_file/
+# auto_append_file directive (.htaccess "php_value auto_prepend_file /x" or
+# .user.ini "auto_prepend_file=/x"), quotes stripped.
+_rs_extract_prepend_target() {
+    local path
+    path="$(printf '%s' "$1" | sed -E 's/.*auto_(prepend|append)_file[[:space:]=]+//')"
+    printf '%s' "$path" | sed -E "s/^[[:space:]]*//;s/[[:space:]]*\$//;s/^[\"']//;s/[\"']\$//"
+}
+
+# _rs_is_wordfence_prepend_legit TARGET -> 0 only if TARGET is the standard
+# Wordfence WAF bootstrap shim (RATSWEEPR-007/R3): never an allowlist keyed on
+# TARGET's filename alone (an attacker can name a file anything) - it must
+# resolve to a real file inside this web root, Wordfence must genuinely be
+# installed, the file must be small, and once comments/whitespace are
+# stripped its ENTIRE body must be nothing but requiring/including a path
+# under the installed wordfence plugin's own waf/ directory - no eval, no
+# superglobals, no network calls, nothing else. Anything that doesn't fit
+# this exact shape stays HIGH.
+_rs_is_wordfence_prepend_legit() {
+    local raw="$1" tfile tsz stripped
+    [ -d "$WPROOT/wp-content/plugins/wordfence/waf" ] || return 1
+    case "$raw" in
+        /*) tfile="$raw" ;;
+        *)  tfile="$WPROOT/$raw" ;;
+    esac
+    [ -f "$tfile" ] || return 1
+    case "$tfile" in "$WPROOT"/*) : ;; *) return 1 ;; esac
+    tsz="$(wc -c < "$tfile" 2>/dev/null || echo 999999)"
+    [ "$tsz" -le 2048 ] 2>/dev/null || return 1
+    stripped="$(sed -E 's#//.*$##' "$tfile" 2>/dev/null | tr -d '[:space:]')"
+    case "$stripped" in
+        *eval\(*|*base64_decode\(*|*gzinflate\(*|*gzuncompress\(*|*system\(*|*exec\(*|*passthru\(*|*assert\(*|*curl_*|*'$_GET'*|*'$_POST'*|*'$_REQUEST'*|*'$_COOKIE'*|*'$_SERVER'*)
+            return 1 ;;
+    esac
+    # Wordfence's real bootstrap shim assigns the waf/ path to a variable and
+    # includes THAT (`include $wordfence_waf_location;`), not a literal string
+    # directly - requiring the literal to be the include's own argument
+    # rejected the genuine file. Checking for both ingredients anywhere in the
+    # stripped body - a require/include statement, and the waf/ path literal -
+    # stays safe because the dangerous-token check above already ran: there is
+    # no eval/exec/superglobal/curl for this pairing to smuggle in.
+    printf '%s' "$stripped" | grep -qE '(require|include)(_once)?[[:space:]]*\(?' || return 1
+    printf '%s' "$stripped" | grep -qF 'wp-content/plugins/wordfence/waf/' || return 1
+    return 0
 }
 
 write_bundled_yara() {
@@ -1557,6 +1897,36 @@ rule RS_cloaker_token_marker_MED {
     condition:
         any of them
 }
+
+rule RS_js_loader_injection_structural {
+    meta:
+        description = "Behavioral third-party loader: admin-bar/bot-timing evasion, a document.cookie 'already injected' gate, a hand-rolled base64 decoder, and/or dynamic <script> element injection - structural match (RATSWEEPR-007), not any single literal, so renamed functions/cookies/endpoints still match. Any ONE signal alone is common in legitimate analytics snippets (a GTM-style loader IS signal 4 alone) - two or more together is the tell."
+        severity = "HIGH"
+    strings:
+        $admin        = "wpadminbar" nocase
+        $newdate      = /new[ \t]*Date[ \t]*\(\)/ nocase
+        $datenow      = /Date\.now[ \t]*\(/ nocase
+        $forloop      = /for[ \t]*\(/
+        $whileloop    = /while[ \t]*\(/
+        $cookiegate   = /document\.cookie[ \t]*=[^\x00]{0,200}expires/ nocase
+        $b64alphabet  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        $fromcharcode = "fromCharCode" nocase
+        $createscript = /createElement\([^)]{0,40}script/ nocase
+        $appendchild  = "appendChild" nocase
+    condition:
+        // Encodes "at least 2 of the 4 behavioral signals" as an OR of every
+        // pairwise AND (6 pairs for 4 signals) - mathematically exact, but
+        // many " and "/" or "s, so native_yara()'s skip-regex bails on this
+        // rule; scan_js_loader_injection_grep_fallback is the real
+        // unconditional enforcement (see its header comment). A real YARA
+        // engine evaluates this rule correctly on its own.
+        (($admin and ($newdate or $datenow)) and ($forloop or $whileloop) and $cookiegate) or
+        (($admin and ($newdate or $datenow)) and ($forloop or $whileloop) and ($b64alphabet and $fromcharcode)) or
+        (($admin and ($newdate or $datenow)) and ($forloop or $whileloop) and ($createscript and $appendchild)) or
+        ($cookiegate and ($b64alphabet and $fromcharcode)) or
+        ($cookiegate and ($createscript and $appendchild)) or
+        (($b64alphabet and $fromcharcode) and ($createscript and $appendchild))
+}
 RSYARA
 }
 
@@ -1866,6 +2236,77 @@ scan_rankmath_fake_core_file() {
         "not a real WordPress core file at any version - the Rank Math PRO supply-chain compromise (Oct 2026) drops this exact path"
 }
 
+# scan_plugin_analytics_module: a set of plugins from one vendor shipped an
+# analytics module (wpos-analytics) that phones home and can drop/inject
+# further payloads - public advisories, early April 2026 (RATSWEEPR-007/R2).
+# No slug list is hard-coded (advisories don't give a definitive one, and a
+# guessed list would miss renamed forks); detection keys on the module name
+# and its phone-home endpoint instead, so it catches the family regardless of
+# which plugin slug carries it.
+scan_plugin_analytics_module() {
+    [ -d "$WPROOT/wp-content/plugins" ] || [ -d "$WPROOT/wp-content/mu-plugins" ] || return
+    info "Checking for Essential Plugin family analytics-module remnants..."
+    local f rel
+    local hits; hits="$(rs_tmp essential-wposanalytics)"
+    find "$WPROOT/wp-content/plugins" "$WPROOT/wp-content/mu-plugins" \
+         -iname 'wpos-analytics*' -print0 2>/dev/null > "$hits"
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        report "HIGH" "plugin-analytics-module" "$rel" \
+            "wpos-analytics module present - according to public advisories (see reference), this is the Essential Plugin family's phone-home/dropper component. Remove the whole plugin folder (deactivating is not enough) and reinstall the WordPress.org-patched version."
+    done < "$hits"
+
+    local filelist; filelist="$(rs_tmp essential-plugin-files)"
+    find "$WPROOT/wp-content/plugins" "$WPROOT/wp-content/mu-plugins" \
+         -type f -name '*.php' -print0 2>/dev/null > "$filelist"
+    local endpointhits; endpointhits="$(rs_tmp essential-endpoint-hits)"
+    xargs -0 grep -lF 'analytics.essentialplugin.com' < "$filelist" 2>/dev/null > "$endpointhits" || true
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        rel="${f#"$WPROOT"/}"
+        report "HIGH" "plugin-analytics-module" "$rel" \
+            "references analytics.essentialplugin.com - according to public advisories (see reference), the Essential Plugin family analytics module's phone-home endpoint. Remove the whole plugin folder (deactivating is not enough) and reinstall the WordPress.org-patched version."
+    done < "$endpointhits"
+    ok "Essential Plugin analytics-module check done."
+}
+
+# scan_fake_core_file: a look-alike core filename sitting in the web root that
+# is NOT in the official checksum manifest. Kept generic (edit distance 1-2
+# against the real top-level core entries, which are fixed and don't vary by
+# version) rather than hard-coding one name, then wp-comments-posts.php (note
+# the extra "s" - core's real file is wp-comments-post.php) is simply the one
+# confirmed, named example: a fake-core-file the Essential Plugin family drops
+# per public advisories, early April 2026 (RATSWEEPR-007/R2).
+scan_fake_core_file() {
+    info "Checking web root for look-alike core file names..."
+    local core_names='index.php|license.txt|readme.html|wp-activate.php|wp-admin|wp-blog-header.php|wp-comments-post.php|wp-config-sample.php|wp-config.php|wp-content|wp-cron.php|wp-includes|wp-links-opml.php|wp-load.php|wp-login.php|wp-mail.php|wp-settings.php|wp-signup.php|wp-trackback.php|xmlrpc.php'
+    local f base rel dist
+    for f in "$WPROOT"/*; do
+        [ -e "$f" ] || continue
+        base="$(basename -- "$f")"
+        rel="${f#"$WPROOT"/}"
+        case "|$core_names|" in *"|$base|"*) continue;; esac   # a genuine core entry
+        if [ "$HAVE_PHP" = "1" ]; then
+            dist="$(php -r '
+                $names = explode("|", $argv[1]); $b = $argv[2]; $best = 999;
+                foreach ($names as $n) { $d = levenshtein($n, $b); if ($d < $best) $best = $d; }
+                echo $best;
+            ' "$core_names" "$base" 2>/dev/null)"
+            case "$dist" in ''|*[!0-9]*) dist=99 ;; esac
+            if [ "$dist" -ge 1 ] && [ "$dist" -le 2 ]; then
+                report "HIGH" "fake-core-file" "$rel" \
+                    "name is within edit distance $dist of a real core file name but is NOT a core file (e.g. wp-comments-posts.php vs. core's wp-comments-post.php - a known Essential Plugin family remnant per public advisories, see reference)"
+            fi
+        elif [ "$base" = "wp-comments-posts.php" ]; then
+            # No php-cli to compute edit distance generically: fall back to the
+            # one confirmed, named example rather than hand-rolling Levenshtein in shell.
+            report "HIGH" "fake-core-file" "$rel" \
+                "wp-comments-posts.php (extra 's') is not a core file - core's real file is wp-comments-post.php. A known Essential Plugin family remnant per public advisories (see reference)"
+        fi
+    done
+    ok "Fake-core-file check done."
+}
+
 # scan_cache_php_files: a .cache file should be inert cached data, never PHP.
 scan_cache_php_files() {
     local f rel
@@ -2032,6 +2473,52 @@ scan_blockchain_js_loader() {
         done < "$candlist"
     done < "$PHPLIST"
     rm -f "$tmp" "$candlist"
+}
+
+# scan_js_loader_injection_grep_fallback: explicit grep/awk-equivalent of
+# RS_js_loader_injection_structural, run UNCONDITIONALLY like the other
+# "_grep_fallback" scanners in this file - a real YARA engine's "2 of 4
+# signal-pairs" condition is correct but native_yara()'s skip-regex bails on
+# anything with this many " and "/" or "s, so this is the actual enforcement
+# path. Reports under the SAME yara: category so finalize_report's dedup
+# collapses it to one line if a real engine also matched. Reuses the shared
+# structural detector (see its header comment) against files instead of DB rows.
+scan_js_loader_injection_grep_fallback() {
+    info "Checking files for the post-content loader structure..."
+    local filelist; filelist="$(rs_tmp loader-files)"
+    find "$WPROOT" \( -path "$WPROOT/wp-content/cache" -o -path "$RS_KIT_DIR" \
+                       -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune \
+         -o -type f \( -name '*.js' -o -name '*.php' -o -name '*.phtml' \
+                       -o -name '*.html' -o -name '*.htm' -o -name '*.inc' \
+                       -o -name '*.json' \) -print0 2>/dev/null > "$filelist"
+    local f rel sz sigfile sig cookie url host flat
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        # no legitimate reason this check needs to read a multi-MB bundle/library
+        sz="$(wc -c < "$f" 2>/dev/null || echo 0)"
+        [ "$sz" -gt 2000000 ] 2>/dev/null && continue
+        grep -qF '<script' "$f" 2>/dev/null || continue   # cheap pre-filter
+        flat="$(_rs_loader_flatten "$f")"
+        sigfile="$(rs_tmp loader-file-sigcount)"
+        rs_loader_count_signals "$flat" > "$sigfile"
+        if [ -s "$sigfile" ]; then
+            sig="$(sort -rn "$sigfile" | head -1)"
+            cookie="$(rs_loader_extract_cookie "$flat")"
+            url="$(rs_loader_decode_url "$flat")"
+            local detail="matched YARA rule RS_js_loader_injection_structural ($sig/4 signals: admin-bar+timing guard, cookie gate, base64 alphabet decoder, dynamic <script> injection)"
+            [ -n "$cookie" ] && detail="$detail; gate cookie '$cookie'"
+            if [ -n "$url" ]; then
+                detail="$detail; decodes to $url"
+                report "HIGH" "yara:RS_js_loader_injection_structural" "$rel" "$detail"
+                host="$(printf '%s' "$url" | sed -E 's#^https?://##; s#[/:?].*##')"
+                [ -n "$host" ] && report "HIGH" "external-request" "$rel" "external request to $host [decoded-from-injection,]"
+            else
+                report "HIGH" "yara:RS_js_loader_injection_structural" "$rel" "$detail"
+            fi
+        fi
+    done < "$filelist"
+    ok "File loader-structure scan done."
 }
 
 # scan_rankmath_readonly_indicators: published IOCs a file/content rule can't
@@ -2230,6 +2717,17 @@ scan_heuristics() {
                     # when downloading Google Font binaries (works around shared-host
                     # CA-bundle issues). See VERIFY.md.
                     report "INFO" "heuristic:$name" "$rel" "matched '$name' in WPBakery's own local-fonts downloader - known-benign vendor behavior"
+                elif case "$name" in hides_admin_users_prequery|hides_admin_users_views|pre_http_request_hook) true;; *) false;; esac \
+                     && case "$rel" in */vendor/*) true;; *) false;; esac \
+                     && _rs_is_benign_vendored_hook "$f"; then
+                    # RATSWEEPR-007/R3: a vendored background-task library that
+                    # merely adds AND removes the hook (toggled, not left
+                    # standing) and never touches $wpdb/wp_users is not the
+                    # "hide the admin account" pattern this rule exists to
+                    # catch - that one keeps the hook registered and performs
+                    # a real user-table write/filter. Kept HIGH whenever
+                    # either of those is true.
+                    report "INFO" "heuristic:$name" "$rel" "matched '$name' inside */vendor/* but only adds+removes the hook with no \$wpdb/wp_users write - benign (vendored library's own transient hook use)"
                 else
                     report "$basesev" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW"
                 fi
@@ -2294,12 +2792,45 @@ scan_external_requests() {
         awk -F'|' '$1=="ALLOWHOST"{print $2}' "$PATTERNS_FILE"
     } | sort -u > "$allow"
 
-    # Pull lines where a URL is an argument to a real HTTP call. Emit host<TAB>file<TAB>line<TAB>flags
+    # Plugin slugs with NO wp.org checksums (scan_plugin_checksums already ran
+    # and left an INFO plugin-premium row for each) - R3(c): premium/vendored
+    # plugins, and themes (this script has no theme-checksum mechanism at
+    # all), get their external-request severity capped at MED; unknown-host
+    # alone is never HIGH for them.
+    local nochecksum; nochecksum="$(rs_tmp exthosts-nochecksum-plugins)"
+    awk -F'\t' '$2=="plugin-premium"{split($3,a," "); sub(/^wp-content\/plugins\//,"",a[1]); print a[1]}' \
+        "$REPORT" 2>/dev/null | sort -u > "$nochecksum"
+
+    # Known-malicious hosts: patterns.conf DOMAIN entries, plus any host this
+    # run already decoded out of an R1 behavioral loader injection - R3(c)'s
+    # one exception to the MED cap above.
+    local badhosts; badhosts="$(rs_tmp exthosts-malicious)"
+    awk -F'|' '$1=="DOMAIN"{print $3}' "$PATTERNS_FILE" > "$badhosts"
+    awk -F'\t' '$4 ~ /decoded-from-injection/ {
+        n=split($4,a," "); for (i=1;i<=n;i++) if (a[i]=="to") { print a[i+1]; break }
+    }' "$REPORT" 2>/dev/null >> "$badhosts"
+
+    # Pull lines where a URL is an argument to a real HTTP call. Emit
+    # host<TAB>file<TAB>line<TAB>flags<TAB>verclass (verified|premium|theme|other).
     local hits="$RS_CACHE/exthits.$$"; : > "$hits"
+    local rel verclass slug
     while IFS= read -r -d '' f; do
-        # scan PHP-ish files only; skip integrity-verified core/plugin files
-        grep -Fxq "${f#"$WPROOT"/}" "$VERIFIED" 2>/dev/null && continue
-        awk -v REL="${f#"$WPROOT"/}" '
+        rel="${f#"$WPROOT"/}"
+        # translation files are data, not call sites - never match here (R3a)
+        case "$rel" in *.l10n.php|*.po|*.mo) continue;; esac
+        verclass="other"
+        if grep -Fxq "$rel" "$VERIFIED" 2>/dev/null; then
+            verclass="verified"
+        else
+            case "$rel" in
+                wp-content/plugins/*/*)
+                    slug="${rel#wp-content/plugins/}"; slug="${slug%%/*}"
+                    grep -Fxq "$slug" "$nochecksum" 2>/dev/null && verclass="premium"
+                    ;;
+                wp-content/themes/*) verclass="theme" ;;
+            esac
+        fi
+        awk -v REL="$rel" -v VERCLASS="$verclass" '
             {
                 line=$0
                 # only lines that both contain a request primitive AND a url
@@ -2312,7 +2843,7 @@ scan_external_requests() {
                     if (url ~ /^http:\/\//) flags=flags "PLAINTEXT,"
                     if (line ~ /sslverify[^,]*(=>|:)[[:space:]]*(false|0)/) flags=flags "NOVERIFY,"
                     if (line ~ /\$[a-zA-Z_]/) flags=flags "DYNAMIC,"
-                    printf "%s\t%s\t%d\t%s\n", host, REL, NR, flags
+                    printf "%s\t%s\t%d\t%s\t%s\n", host, REL, NR, flags, VERCLASS
                 }
             }' "$f" >> "$hits"
     done < "$PHPLIST"
@@ -2328,14 +2859,21 @@ scan_external_requests() {
     xargs -0 grep -lE "add_filter\s*\(\s*['\"]pre_http_request" < "$PHPLIST" 2>/dev/null \
         | sed "s#^$WPROOT/##" | sort -u > "$hookfiles" || true
 
-    local host file ln flags known esc detail sev
-    # de-dup on host+file
-    sort -u "$hits" | while IFS=$'\t' read -r host file ln flags; do
-        # allowlisted (suffix match)?
+    local host file ln flags verclass known esc detail sev is_placeholder is_bad
+    # de-dup on host+file+verclass
+    sort -u "$hits" | while IFS=$'\t' read -r host file ln flags verclass; do
+        # R3(a): documentation placeholder hosts are never a real finding.
+        is_placeholder=0
+        case "$host" in
+            example.com|example.org|yoursite.com|localhost|*.example.com|*.example.org|*.yoursite.com) is_placeholder=1;;
+        esac
+
         known=0
         while IFS= read -r a; do
             case "$host" in *".$a"|"$a") known=1; break;; esac
         done < "$allow"
+        is_bad=0
+        grep -Fxq "$host" "$badhosts" 2>/dev/null && is_bad=1
 
         esc=""
         [ "$known" = "0" ] && esc="unknown-host,"
@@ -2344,8 +2882,15 @@ scan_external_requests() {
         if grep -Fxq "$file" "$hookfiles" 2>/dev/null; then esc="${esc}near-license-hook,"; fi
 
         detail="external request to $host [${esc%,}]"
-        # severity: unknown host + (http|noverify|hook) = HIGH; unknown alone = MED; known w/ hook = MED; else INFO
-        if [ "$known" = "0" ] && { case ",$esc" in *http,*|*sslverify-off,*|*near-license-hook,*) true;; *) false;; esac; }; then
+        if [ "$is_placeholder" = "1" ]; then
+            sev="INFO"; detail="$detail - documentation placeholder host"
+        elif [ "$verclass" = "verified" ]; then
+            sev="INFO"; detail="$detail - call site is in a checksum-verified file"
+        elif [ "$is_bad" = "1" ]; then
+            sev="HIGH"; detail="$detail - host matches a known-malicious/decoded-injection host"
+        elif [ "$verclass" = "premium" ] || [ "$verclass" = "theme" ]; then
+            sev="MED"; detail="$detail - no checksums available for this plugin/theme; unknown-host alone is never HIGH"
+        elif [ "$known" = "0" ] && { case ",$esc" in *http,*|*sslverify-off,*|*near-license-hook,*) true;; *) false;; esac; }; then
             sev="HIGH"
         elif [ "$known" = "0" ]; then
             sev="MED"
@@ -2363,7 +2908,8 @@ scan_external_requests() {
 scan_htaccess() {
     info "Auditing .htaccess files..."
     local htlist; htlist="$(rs_tmp htaccess-files)"
-    find "$WPROOT" -type f -name '.htaccess' -print0 2>/dev/null > "$htlist"
+    find "$WPROOT" \( -path "$RS_KIT_DIR" -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
+         -type f -name '.htaccess' -print0 2>/dev/null > "$htlist"
     while IFS= read -r -d '' f; do
         if grep -qIE 'base64|AddHandler|AddType[[:space:]]+application/x-httpd-php|auto_(ap|pre)pend_file|RewriteRule[^#]*(\.ru|\.cn|\.top)/' "$f" 2>/dev/null; then
             report "MED" "htaccess-suspicious" "${f#"$WPROOT"/}" "contains handler/append/base64/redirect directives - REVIEW"
@@ -2374,10 +2920,15 @@ scan_htaccess() {
         # generic MED above, rather than leaving the operator to go dig for it.
         local prepline; prepline="$(grep -iE 'auto_(prepend|append)_file' "$f" 2>/dev/null | head -1)"
         if [ -n "$prepline" ]; then
-            local reprel="${f#"$WPROOT"/}" prepsev="HIGH"
-            allowpath_check "$reprel" && prepsev="INFO"
+            local reprel="${f#"$WPROOT"/}" prepsev="HIGH" prepreason="" preptarget
+            preptarget="$(_rs_extract_prepend_target "$prepline")"
+            if _rs_is_wordfence_prepend_legit "$preptarget"; then
+                prepsev="INFO"; prepreason=" (allowlisted: Wordfence WAF bootstrap shim, content-verified)"
+            elif allowpath_check "$reprel"; then
+                prepsev="INFO"; prepreason=" (allowlisted: trusted vendor path)"
+            fi
             report "$prepsev" "htaccess-auto-prepend-persistence" "$reprel" \
-                "auto_prepend_file/auto_append_file directive - $(printf '%s' "$prepline" | sed -E 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                "auto_prepend_file/auto_append_file directive - $(printf '%s' "$prepline" | sed -E 's/^[[:space:]]*//;s/[[:space:]]*$//')$prepreason"
         fi
         # .cache mapped to a PHP handler: zero legitimate use, a Rank Math PRO
         # supply-chain pattern (Oct 2026) for running the .cache files it drops.
@@ -2404,7 +2955,8 @@ scan_user_ini() {
     info "Checking .user.ini files for auto_prepend/auto_append persistence..."
     local f rel line path sev
     local inilist; inilist="$(rs_tmp user-ini-files)"
-    find "$WPROOT" -type f -name '.user.ini' -print0 2>/dev/null > "$inilist"
+    find "$WPROOT" \( -path "$RS_KIT_DIR" -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
+         -type f -name '.user.ini' -print0 2>/dev/null > "$inilist"
     local inihits; inihits="$(rs_tmp user-ini-hits)"
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
@@ -2413,10 +2965,14 @@ scan_user_ini() {
             path="${line#*=}"
             path="$(printf '%s' "$path" | sed -E "s/^[[:space:]]*//;s/[[:space:]]*\$//;s/^[\"']//;s/[\"']\$//")"
             [ -n "$path" ] || continue
-            sev="HIGH"
-            allowpath_check "$rel" && sev="INFO"
+            sev="HIGH"; local inireason=""
+            if _rs_is_wordfence_prepend_legit "$path"; then
+                sev="INFO"; inireason=" (allowlisted: Wordfence WAF bootstrap shim, content-verified)"
+            elif allowpath_check "$rel"; then
+                sev="INFO"; inireason=" (allowlisted: trusted vendor path)"
+            fi
             report "$sev" "ini-auto-prepend-persistence" "$rel" \
-                "auto_prepend_file/auto_append_file persistence in .user.ini -> $path"
+                "auto_prepend_file/auto_append_file persistence in .user.ini -> $path$inireason"
         done < "$inihits"
     done < "$inilist"
     ok ".user.ini audit done."
@@ -2552,6 +3108,98 @@ scan_database() {
         report "MED" "db-cron" "option:cron" "cron option contains eval/base64/odd URLs - inspect with: wp cron event list"
     fi
     ok "Database scan done."
+}
+
+# scan_db_loader_injection: the generic db-post-injection MED check above (any
+# <script>/eval/iframe in published content) buries a real behavioral loader
+# inside dozens of legitimate page-builder markup hits - a field run missed
+# exactly this. This is the dedicated, own-category HIGH check: scans
+# post_content/post_excerpt across EVERY post_type and post_status (including
+# 'revision' - the loader is routinely copied into revisions too, leaving no
+# clean copy to restore from) plus the options and postmeta most abused for
+# stored injection, through the shared structural detector in
+# rs_loader_count_signals (see its header comment for the four signals).
+scan_db_loader_injection() {
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    info "Scanning database content for the post-content loader structure..."
+
+    local rowfile; rowfile="$(rs_tmp loader-db-row)"
+    local rows; rows="$(rs_tmp loader-db-rows)"
+    local id ptype pstatus mid pid optname_hit
+
+    # 1. post_content, every type/status (incl. revisions)
+    db_query "SELECT ID, post_type, post_status FROM ${P}posts WHERE post_content LIKE '%<script%' LIMIT 2000;" > "$rows"
+    while IFS=$'\t' read -r id ptype pstatus; do
+        [ -n "$id" ] || continue
+        db_query "SELECT post_content FROM ${P}posts WHERE ID=$id LIMIT 1;" > "$rowfile"
+        _rs_report_db_loader_hit "post:$id" "$ptype/$pstatus" "$rowfile"
+    done < "$rows"
+
+    # 2. post_excerpt
+    db_query "SELECT ID, post_type, post_status FROM ${P}posts WHERE post_excerpt LIKE '%<script%' LIMIT 500;" > "$rows"
+    while IFS=$'\t' read -r id ptype pstatus; do
+        [ -n "$id" ] || continue
+        db_query "SELECT post_excerpt FROM ${P}posts WHERE ID=$id LIMIT 1;" > "$rowfile"
+        _rs_report_db_loader_hit "post-excerpt:$id" "$ptype/$pstatus" "$rowfile"
+    done < "$rows"
+
+    # 3. options most often abused for injection: legacy per-widget-type
+    #    storage (widget_text/widget_custom_html/widget_block - each an array
+    #    of every instance of that widget type), sidebars_widgets (included
+    #    for completeness per spec; it only ever holds widget-ID assignments,
+    #    never markup, so it cannot match), blogdescription, and theme mods.
+    db_query "SELECT option_name FROM ${P}options
+              WHERE option_name IN ('widget_text','widget_custom_html','widget_block','sidebars_widgets','blogdescription')
+                AND option_value LIKE '%<script%';" > "$rows"
+    while IFS= read -r optname_hit; do
+        [ -n "$optname_hit" ] || continue
+        db_query "SELECT option_value FROM ${P}options WHERE option_name='$optname_hit' LIMIT 1;" > "$rowfile"
+        _rs_report_db_loader_hit "option:$optname_hit" "option" "$rowfile"
+    done < "$rows"
+    db_query "SELECT option_name FROM ${P}options
+              WHERE option_name LIKE 'theme_mods_%' AND option_value LIKE '%<script%';" > "$rows"
+    while IFS= read -r optname_hit; do
+        [ -n "$optname_hit" ] || continue
+        db_query "SELECT option_value FROM ${P}options WHERE option_name='$optname_hit' LIMIT 1;" > "$rowfile"
+        _rs_report_db_loader_hit "option:$optname_hit" "option" "$rowfile"
+    done < "$rows"
+
+    # 4. postmeta: page-builder data (Elementor/Divi/Beaver/etc. all store raw
+    #    markup here under their own meta_key) - matched generically by
+    #    content rather than an enumerated list of builder-specific keys, so
+    #    a builder this script has never heard of is still covered.
+    db_query "SELECT meta_id, post_id FROM ${P}postmeta WHERE meta_value LIKE '%<script%' LIMIT 1000;" > "$rows"
+    while IFS=$'\t' read -r mid pid; do
+        [ -n "$mid" ] || continue
+        db_query "SELECT meta_value FROM ${P}postmeta WHERE meta_id=$mid LIMIT 1;" > "$rowfile"
+        _rs_report_db_loader_hit "postmeta:$mid" "post:$pid" "$rowfile"
+    done < "$rows"
+
+    ok "Database loader-structure scan done."
+}
+_rs_report_db_loader_hit() { # _rs_report_db_loader_hit LOCATION LOCINFO ROWFILE
+    local loc="$1" locinfo="$2" rf="$3" flat sigfile sig cookie url host
+    [ -s "$rf" ] || return
+    flat="$(_rs_loader_flatten "$rf")"
+    sigfile="$(rs_tmp loader-db-sigcount)"
+    rs_loader_count_signals "$flat" > "$sigfile"
+    if [ -s "$sigfile" ]; then
+        sig="$(sort -rn "$sigfile" | head -1)"
+        cookie="$(rs_loader_extract_cookie "$flat")"
+        url="$(rs_loader_decode_url "$flat")"
+        local detail="behavioral loader structure ($sig/4 signals: admin-bar+timing guard, cookie gate, base64 alphabet decoder, dynamic <script> injection)"
+        [ -n "$cookie" ] && detail="$detail; gate cookie '$cookie'"
+        if [ -n "$url" ]; then
+            detail="$detail; decodes to $url"
+            report "HIGH" "db-loader-injection" "$loc ($locinfo)" "$detail"
+            host="$(printf '%s' "$url" | sed -E 's#^https?://##; s#[/:?].*##')"
+            [ -n "$host" ] && report "HIGH" "external-request" "$loc" "external request to $host [decoded-from-injection,]"
+        else
+            report "HIGH" "db-loader-injection" "$loc ($locinfo)" "$detail"
+        fi
+    fi
 }
 
 # scan_malicious_options: wp_options rows holding attacker payload data - either
@@ -3287,8 +3935,11 @@ run_scan() {
     rs_timed scan_mu_plugins
     rs_timed scan_xss_hidden_admin_paths
     rs_timed scan_rankmath_fake_core_file
+    rs_timed scan_plugin_analytics_module
+    rs_timed scan_fake_core_file
     rs_timed scan_cache_php_files
     rs_timed scan_blockchain_js_loader
+    rs_timed scan_js_loader_injection_grep_fallback
     rs_timed scan_wpconfig_content
     rs_timed scan_uploads_php
     rs_timed scan_asset_tampering
@@ -3309,6 +3960,7 @@ run_scan() {
     rs_timed scan_htaccess
     rs_timed scan_user_ini
     rs_timed scan_database
+    rs_timed scan_db_loader_injection
     rs_timed scan_updraftcentral_variant2_indicators
     rs_timed scan_rankmath_readonly_indicators
     rs_timed scan_malicious_options
@@ -3340,19 +3992,48 @@ run_scan() {
         bad "SCAN INCOMPLETE: $incomplete check(s) could not run - see check-incomplete findings below; results are NOT a clean bill of health"
         say ""
     fi
-    # VERDICT: a coarse read from HIGH counts alone, not a replacement for
-    # actually reading the findings - 0 HIGH is CLEAN, 1-2 is SUSPICIOUS
-    # (worth a close look), 3+ is COMPROMISED (act on it). An incomplete scan
-    # can never read as CLEAN, no matter how few HIGH findings it collected.
-    if [ "$incomplete" -gt 0 ] && [ "$high" -lt 1 ]; then
-        warn "VERDICT: INCOMPLETE  (0 HIGH findings, but $incomplete check(s) did not run - re-run once fixed)"
-    elif [ "$high" -ge 3 ]; then
-        bad "VERDICT: COMPROMISED  ($high HIGH finding(s))"
-    elif [ "$high" -ge 1 ]; then
-        warn "VERDICT: SUSPICIOUS  ($high HIGH finding(s))"
+    # VERDICT (RATSWEEPR-007/R4): a HIGH count alone used to drive this, and
+    # every false-positive HIGH in R3's table (locale version.php, Wordfence's
+    # own bootstrap, a host-managed mu-plugin, an empty uploads stub, a
+    # vendored library's own API host...) made every stock/clean install read
+    # as COMPROMISED. A scanner that cries wolf on every clean site trains
+    # people to ignore it. So: COMPROMISED now requires at least one HIGH in a
+    # category that actually CONFIRMS malware/compromise (not merely an
+    # integrity oddity worth a human look) - db-loader-injection, the
+    # Essential Plugin remnants, wp-config-injection, a YARA/hash match, a
+    # confirmed webshell-pattern heuristic, real code in uploads, or an admin
+    # account correlated to an exploit artifact. Any OTHER HIGH (the
+    # integrity/oddity kind - e.g. core-unknown-file, mu-plugin-unexpected
+    # that didn't match an allowlisted hash) is real and still surfaced, just
+    # under NEEDS REVIEW rather than a false "you're compromised." Zero HIGH
+    # of either kind is NO KNOWN MALWARE FOUND, never "CLEAN" - this scanner
+    # cannot prove absence. SCAN INCOMPLETE still wins over all of this.
+    local confirm_high; confirm_high="$(awk -F'\t' '
+        $1=="HIGH" {
+            c=$2
+            if (c=="db-loader-injection" || c=="plugin-analytics-module" || c=="fake-core-file" ||
+                c=="wp-config-injection" || c=="known-malware" || c=="php-in-uploads" ||
+                c=="compromise:ADMIN_CREATED_BY_EXPLOIT" || c=="compromise:CHANGESET_POC_PATTERN" ||
+                c ~ /^yara:/ || c ~ /^heuristic:/) print
+        }' "$REPORT" | wc -l | tr -d ' ')"
+    local verdict_str=""
+    if [ "$incomplete" -gt 0 ]; then
+        warn "VERDICT: INCOMPLETE  ($incomplete check(s) did not run - re-run once fixed; not a clean bill of health)"
+        verdict_str="INCOMPLETE"
+    elif [ "$confirm_high" -gt 0 ]; then
+        bad "VERDICT: COMPROMISED  ($confirm_high confirmed finding(s) of $high total HIGH)"
+        verdict_str="COMPROMISED"
+    elif [ "$high" -gt 0 ]; then
+        warn "VERDICT: NEEDS REVIEW  ($high high-severity integrity/oddity item(s) to verify - see 'Verify these' below)"
+        verdict_str="SUSPICIOUS"
     else
-        ok "VERDICT: CLEAN  (0 HIGH findings)"
+        ok "VERDICT: NO KNOWN MALWARE FOUND  (0 HIGH findings - this does not prove absence; review MED findings too)"
+        verdict_str="CLEAN"
     fi
+    # Machine-readable trailer, kept greppable for existing tooling: maps the
+    # new wording back onto the old CLEAN/SUSPICIOUS/COMPROMISED/INCOMPLETE
+    # strings so a script watching for "verdict=" doesn't need to change.
+    report "META" "verdict" "-" "verdict=$verdict_str"
     say ""
     if [ "$high" -gt 0 ]; then
         say "  --- HIGH (clustered) ---"
@@ -3361,6 +4042,19 @@ run_scan() {
     if [ "$med" -gt 0 ]; then
         say "  --- MED (clustered) ---"
         summarize_clustered "MED"
+    fi
+    if [ "$verdict_str" = "SUSPICIOUS" ]; then
+        say ""
+        say "  --- Verify these (integrity/oddity HIGH findings, not a confirmed compromise) ---"
+        awk -F'\t' '
+            $1=="HIGH" {
+                c=$2
+                if (c=="db-loader-injection" || c=="plugin-analytics-module" || c=="fake-core-file" ||
+                    c=="wp-config-injection" || c=="known-malware" || c=="php-in-uploads" ||
+                    c=="compromise:ADMIN_CREATED_BY_EXPLOIT" || c=="compromise:CHANGESET_POC_PATTERN" ||
+                    c ~ /^yara:/ || c ~ /^heuristic:/) next
+                printf "  %-28s %s\n", c, $3
+            }' "$REPORT"
     fi
     say ""
     # Grouped external-request digest: one line per unique host, worst severity.
@@ -3384,7 +4078,7 @@ run_scan() {
     say "  Next step: review MED findings (heuristics DO false-positive - check each file)."
     say ""
     say "  This free version only reports. It did not change, move or delete anything."
-    if grep -qE $'^(HIGH|MED)\t(wp-config-rogue-include|wp-config-injected-code)\t' "$REPORT" 2>/dev/null; then
+    if grep -qE $'^(HIGH|MED)\t(wp-config-rogue-include|wp-config-injection)\t' "$REPORT" 2>/dev/null; then
         say ""
         say "  wp-config.php was flagged. Never delete or move it - the site needs it to run."
         say "  Run: ratsweepr.sh wp-config-review   (shows the exact lines, secrets masked)"
@@ -3403,10 +4097,10 @@ run_scan() {
 HELP_REPORT_TEXT="Is it empty but you suspect there's something wrong? Or don't understand the results?
 Download the report and send it to hello@ratsweepr.com"
 
-# latest_report: newest ratsweepr-*.report in the WP root (redacted copies excluded).
+# latest_report: newest ratsweepr-*.report in $RS_REPORT_DIR (redacted copies excluded).
 latest_report() {
     local f best=""
-    for f in "$WPROOT"/ratsweepr-*.report; do
+    for f in "$RS_REPORT_DIR"/ratsweepr-*.report; do
         [ -f "$f" ] || continue
         case "$f" in *.shared.report) continue;; esac
         if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best="$f"; fi
@@ -3596,9 +4290,11 @@ Usage (run from the WordPress root, where wp-config.php lives):
   ratsweepr.sh                  interactive menu
   ratsweepr.sh scan             full read-only scan -> report
   ratsweepr.sh scan --since 2026-07-01   also list DB content modified since a date
+  ratsweepr.sh scan --report-dir DIR     write report to DIR (default: $HOME/ratsweepr-reports)
   ratsweepr.sh update-sigs      refresh rfxn hash DB + pattern file
   ratsweepr.sh share-report     make a redacted copy of the latest report (opt-in, nothing is uploaded)
   ratsweepr.sh wp-config-review review flagged wp-config.php lines (read-only, secrets masked)
+  ratsweepr.sh print-hash FILE  SHA-256 of FILE, for allowlist.conf
   ratsweepr.sh help-report      report looks empty, or you don't understand it?
   ratsweepr.sh help             this help
 EOU
@@ -3628,10 +4324,12 @@ main_menu() {
 }
 
 SINCE_DATE=""
+RS_REPORT_DIR_OVERRIDE=""
 cmd="${1:-menu}"; shift || true
 while [ $# -gt 0 ]; do
     case "$1" in
         --since) SINCE_DATE="${2:-}"; shift 2;;
+        --report-dir) RS_REPORT_DIR_OVERRIDE="${2:-}"; shift 2;;
         *) set -- "$1" "${@:2}"; break;;
     esac
 done
@@ -3639,12 +4337,13 @@ done
 # Commands that don't need a WordPress root are handled before preflight, so
 # help and unknown/removed commands work from any directory.
 case "$cmd" in
-    menu|scan|update-sigs|share-report|wp-config-review|help-report) ;;
+    menu|scan|update-sigs|share-report|wp-config-review|print-hash|help-report) ;;
     help|-h|--help)  usage; exit 0;;
     *)               usage; die "Unknown command: $cmd (RatSweepr Free is read-only; cleanup commands are not included)";;
 esac
 
 preflight
+setup_report_paths
 
 case "$cmd" in
     menu)            main_menu;;
@@ -3652,5 +4351,7 @@ case "$cmd" in
     update-sigs)     update_signatures;;
     share-report)    share_report;;
     wp-config-review) wp_config_review;;
+    print-hash)      [ $# -ge 1 ] || die "Usage: $0 print-hash <file>"
+                     print_hash "$1";;
     help-report)     help_report;;
 esac

@@ -167,7 +167,7 @@ rm -f ratsweepr.sh ratsweepr-*.report ratsweepr-*.shared.report SHA256SUMS
    `payload.php`. This is a filename check, so it works without `php-cli`.
 3. **Plugin integrity**: downloads.wordpress.org plugin checksums for each
    installed version: modified and unknown files inside each plugin.
-4. **YARA content rules (36)**: the bundled `ratsweepr.yar` ruleset (obfuscated eval
+4. **YARA content rules (40)**: the bundled `ratsweepr.yar` ruleset (obfuscated eval
    chains, `pack()`/`str_rot13`/`gzinflate` droppers, cookie- and header-fed
    backdoors, command-exec webshells, self-hiding fake plugins, dual-use file
    managers, obfuscated JavaScript injection, external script tags pointing at
