@@ -13,7 +13,14 @@ rule RS_eval_user_input {
         // retrieval(...), both of which contain "eval(" as a bare substring -
         // confirmed against a clean Gravity Forms copy, see VERIFY.md
         $a = /\b(eval|assert)\s*\(\s*(stripslashes\s*\()?\s*\$_(POST|GET|REQUEST|COOKIE)/ nocase
-        $b = /\b(eval|assert)\s*\(\s*\$[a-zA-Z_]+\s*\)/ nocase
+        // RATSWEEPR-009/R1: a bare eval($var)/assert($var) used to match
+        // unconditionally, which false-positived on a vendored template
+        // engine's eval() of its own rendered buffer (no user input anywhere
+        // near it). Now requires a request superglobal or php://input to
+        // appear INSIDE the same eval/assert call - either directly, or via
+        // an assignment nested in the same argument expression
+        // (eval($x = $_GET['a'])) - never just "eval of some variable."
+        $b = /\b(eval|assert)\s*\([^;]{0,200}(\$_(GET|POST|REQUEST|COOKIE)\b|php:\/\/input)/ nocase
     condition:
         any of them
 }

@@ -41,7 +41,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.26-free"
+RS_VERSION="2.9.27-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -274,6 +274,20 @@ preflight() {
     HAVE_MYSQL=0;   have mysql   && HAVE_MYSQL=1
     HAVE_OPENSSL=0; have openssl && HAVE_OPENSSL=1
 
+    # RATSWEEPR-009/R1: the banner used to print "php: 1  mysql: 1" (the
+    # presence flags above) instead of anything a human could use - now the
+    # actual version string, or "none".
+    PHP_VER_STR="none"
+    if [ "$HAVE_PHP" = "1" ]; then
+        PHP_VER_STR="$(php -r 'echo PHP_VERSION;' 2>/dev/null)"
+        [ -n "$PHP_VER_STR" ] || PHP_VER_STR="unknown"
+    fi
+    MYSQL_VER_STR="none"
+    if [ "$HAVE_MYSQL" = "1" ]; then
+        MYSQL_VER_STR="$(mysql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        [ -n "$MYSQL_VER_STR" ] || MYSQL_VER_STR="unknown"
+    fi
+
     JSON_PARSER=""
     if have jq; then JSON_PARSER="jq"
     elif [ "$HAVE_PHP" = "1" ]; then JSON_PARSER="php"
@@ -372,7 +386,7 @@ banner() {
     say ""
     say "  RatSweepr Free - read-only WordPress malware scanner   v$RS_VERSION"
     say "  Site: $WPROOT"
-    say "  WordPress: $WPVER    WP-CLI: ${WPCLI:-not found}    php: $HAVE_PHP  mysql: $HAVE_MYSQL"
+    say "  WordPress: $WPVER    WP-CLI: ${WPCLI:-not found}    php: $PHP_VER_STR  mysql: $MYSQL_VER_STR"
     say ""
 }
 
@@ -482,16 +496,96 @@ CORE_VULN|CVE-2026-87902 (unauth path-traversal LFI->RCE, CVSS 9.2)|4.7.0|7.1.1|
 # Hosts here are treated as unremarkable destinations (suffix match, so
 # "elementor.com" also covers "my.elementor.com"). Add vendors you trust after
 # confirming them, to keep the external-request report focused on unknowns.
+# No hosting-company brand belongs here (RATSWEEPR-009/R6) - a host-managed
+# mu-plugin tree is recognized by STRUCTURE (see scan_managed_mu_plugin_structural)
+# or by `ratsweepr.sh trust-path`, never by a brand name baked into this file.
 ALLOWHOST|elementor.com
 ALLOWHOST|automattic.com
 ALLOWHOST|akismet.com
 ALLOWHOST|wordfence.com
 ALLOWHOST|woocommerce.com
-ALLOWHOST|kinsta.com
-ALLOWHOST|kinsta.cloud
 #
 # --- trusted vendor paths (ALLOWPATH|prefix|reinstall-url-or-dash) ---
-ALLOWPATH|wp-content/mu-plugins/kinsta-mu-plugins|https://kinsta.com/kinsta-tools/kinsta-mu-plugins.zip
+# No entries ship by default (RATSWEEPR-009/R6) - use `ratsweepr.sh trust-path`
+# to trust a host-managed path by content hash instead of hard-coding one here.
+#
+# --- large-file exceptions for scan_payload_containers/scan_disguised_data_php
+#     (CONTAINEREXCLUDE|path-glob, relative to the WordPress root) - ships
+#     empty, add your own confirmed-benign large/odd files here ---
+#
+# --- vendored dev-tooling dot-directories exempted from hidden-dir-php
+#     (DEVDIRALLOW|path-fragment, matched as a path suffix/prefix - these are
+#     EXAMPLES, not a brand-specific or exhaustive list, RATSWEEPR-009/R2) ---
+DEVDIRALLOW|.git
+DEVDIRALLOW|.github
+DEVDIRALLOW|.husky
+DEVDIRALLOW|.vscode
+DEVDIRALLOW|.idea
+DEVDIRALLOW|node_modules/.bin
+DEVDIRALLOW|.well-known
+#
+# --- known official premium-plugin slugs that aren't on wordpress.org, so they
+#     can never pass a checksum check, but ARE a genuine official vendor package
+#     (OFFICIALSLUG|slug) - RATSWEEPR-009/R1, extend as you confirm more ---
+OFFICIALSLUG|woo-update-manager
+#
+# --- fake security/SEO plugin header indicators (RATSWEEPR-009/R2) - a header
+#     match alone is MED (plausible names can exist for real products); a second
+#     signal (suffix family, hidden-dir copy, unverified checksum, .dat sibling,
+#     external enqueue, option IOC) makes it HIGH. Never flags a
+#     checksum-verified plugin by name/author alone. Extend as you find more. ---
+FAKEPLUGINAUTHOR|SiteGuard Tools
+FAKEPLUGINNAME|ClickFix Guard
+FAKEPLUGINNAME|Master Guardian
+FAKEPLUGINNAME|Watch Guardian
+FAKEPLUGINNAME|Content Sync Connector
+FAKEPLUGINNAME|Defence Spam
+FAKEPLUGINNAME|Webpage Schema Markup
+FAKEPLUGINNAME|Content Tweaks
+FAKEPLUGINNAME|Google Track
+FAKEPLUGINNAME|Nimble Inspector Kit
+FAKEPLUGINNAME|Cache Helper
+FAKEPLUGINNAME|Media Cache
+#
+# --- slugs commonly impersonated by a fake plugin dir named <slug>-<8hex>
+#     (RATSWEEPR-009/R2's suffix-family check also matches any INSTALLED
+#     plugin's own slug automatically; this is just a short seed list for
+#     well-known targets even when the real plugin isn't installed here) ---
+IMPERSONATEDSLUG|wordfence
+IMPERSONATEDSLUG|woocommerce
+IMPERSONATEDSLUG|akismet
+IMPERSONATEDSLUG|elementor
+IMPERSONATEDSLUG|jetpack
+#
+# --- class/option-reference indicators of the RATSWEEPR-009/R2 persistence
+#     family (CLASSIOC|class-name, OPTIONREFIOC|option-name-literal-in-code) ---
+CLASSIOC|WP_Runtime_Guard
+CLASSIOC|CSC_Watchdog
+OPTIONREFIOC|csc_recovery_package
+OPTIONREFIOC|csc_connector_revoked
+#
+# --- wp_options NAME PREFIXES (shell-glob, matched against option_name and
+#     against cron-option hook names) tied to the same family (RATSWEEPR-009/R2) ---
+DBOPTIONPREFIX|csc_*
+DBOPTIONPREFIX|sps_cfg_*
+DBOPTIONPREFIX|guardian_*
+DBOPTIONPREFIX|_wp_cg_*
+#
+# --- crawler/bot User-Agent tokens (RATSWEEPR-009/R4) - crawlers do not hold
+#     logged-in administrator sessions, so one of these inside session_tokens'
+#     user agent is a strong tell that the session was forged/replayed ---
+CRAWLERUA|meta-externalagent
+CRAWLERUA|facebookexternalhit
+CRAWLERUA|Googlebot
+CRAWLERUA|bingbot
+CRAWLERUA|AhrefsBot
+CRAWLERUA|SemrushBot
+CRAWLERUA|GPTBot
+CRAWLERUA|ClaudeBot
+CRAWLERUA|CCBot
+CRAWLERUA|python-requests
+CRAWLERUA|curl/
+CRAWLERUA|Go-http-client
 #
 # --- known-vulnerable plugin versions (hand-picked from public advisories,
 #     NOT a full vulnerability database - see README) ---
@@ -529,6 +623,26 @@ write_default_allowlist() {
 # DIFFERENT hash always stays HIGH, even if a glob below matches its path.
 EOALLOW
     ok "Wrote bundled allowlist -> $RS_SIG_DIR/allowlist.conf"
+}
+
+# write_default_iocs (RATSWEEPR-009/R2): one network IOC hostname per line,
+# never fetched - grep targets only. Kept in its own file (not patterns.conf)
+# so it stays trivially easy to extend/replace independently.
+write_default_iocs() {
+    printf '# RatSweepr bundled network IOCs [bundled-version: %s]\n' "$RS_VERSION" \
+        > "$RS_SIG_DIR/iocs.conf"
+    cat >> "$RS_SIG_DIR/iocs.conf" << 'EOIOC'
+# One host (or host fragment) per line. '#' comments allowed. RatSweepr never
+# fetches these - they are grep targets only, checked against files, options,
+# posts/postmeta and theme templates (scan_network_iocs). Extend as you find
+# more; this is a hand-picked starter list, not a maintained threat feed.
+sverigegladtid.com
+kjhg.lol
+boostrabcdn.com
+searchranktraffic
+amunrapex
+EOIOC
+    ok "Wrote bundled network IOCs -> $RS_SIG_DIR/iocs.conf"
 }
 
 update_signatures() {
@@ -596,6 +710,14 @@ load_signatures() {
         write_default_allowlist
     fi
     ALLOWLIST_FILE="$RS_SIG_DIR/allowlist.conf"
+
+    local iocs_bundled_ver=""
+    [ -f "$RS_SIG_DIR/iocs.conf" ] && \
+        iocs_bundled_ver="$(sed -n 's/.*\[bundled-version: \([0-9.]*\)\].*/\1/p' "$RS_SIG_DIR/iocs.conf" | head -1)"
+    if [ ! -s "$RS_SIG_DIR/iocs.conf" ] || [ "$iocs_bundled_ver" != "$RS_VERSION" ]; then
+        write_default_iocs
+    fi
+    IOCS_FILE="$RS_SIG_DIR/iocs.conf"
 }
 
 # allowlist_hash_check REL SHA256 -> 0 on a path-glob+hash match in
@@ -631,6 +753,148 @@ print_hash() { # print_hash FILE -> sha256, with a ready-to-paste allowlist.conf
     say "  ALLOWMU|$rel|$hash|host-managed mu-plugin"
     say ""
     say "Only add this if you have verified by hand that the file is legitimate."
+}
+
+# ---------------------------- trust-path (RATSWEEPR-009/R6) -------------------
+# A content-hash-based alternative to naming a host/brand in code: the
+# operator explicitly trusts a path (a file, or a whole directory - every file
+# under it, hashed individually) and that trust is revoked automatically the
+# instant any byte changes. Never silent: a changed hash is always reported as
+# trusted-path-modified HIGH, never just re-trusted quietly.
+_rs_trustpath_hash_one() { # _rs_trustpath_hash_one FILE -> sha256, or empty
+    local h
+    h="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+    [ -n "$h" ] || h="$(shasum -a 256 "$1" 2>/dev/null | awk '{print $1}')"
+    printf '%s' "$h"
+}
+# _rs_trustpath_filelist TARGET -> one relative-path-within-TARGET per line
+# (just the basename for a single file, so file and dir cases share one shape)
+_rs_trustpath_filelist() {
+    local target="$1"
+    if [ -d "$target" ]; then
+        ( cd "$target" 2>/dev/null && find . -type f | sed 's#^\./##' ) | sort
+    else
+        basename -- "$target"
+    fi
+}
+# _rs_trustpath_manifest TARGET FILELIST -> "relfile<TAB>sha256" per line on stdout
+_rs_trustpath_manifest() {
+    local target="$1" filelist="$2" relf fullf h
+    while IFS= read -r relf; do
+        [ -n "$relf" ] || continue
+        if [ -d "$target" ]; then fullf="$target/$relf"; else fullf="$target"; fi
+        h="$(_rs_trustpath_hash_one "$fullf")"
+        printf '%s\t%s\n' "$relf" "$h"
+    done < "$filelist"
+}
+
+trust_path() { # trust_path REL  (REL relative to $WPROOT; honors $RS_TRUSTPATH_YES)
+    local rel="$1"
+    [ -n "$rel" ] || die "Usage: ratsweepr.sh trust-path <relative-path> [--yes]"
+    case "$rel" in /*) die "trust-path takes a path RELATIVE to the WordPress root, not an absolute one." ;; esac
+    local target="$WPROOT/$rel"
+    [ -e "$target" ] || die "No such path under the WordPress root: $rel"
+
+    local filelist; filelist="$(rs_tmp trustpath-files)"
+    _rs_trustpath_filelist "$target" > "$filelist"
+    local n; n="$(wc -l < "$filelist" | tr -d ' ')"
+    [ "$n" -gt 0 ] || die "No files found under: $rel"
+
+    say ""
+    say "About to trust $n file(s) under: $rel"
+    say "As long as their content doesn't change, future scans will skip them silently"
+    say "(a single changed byte in any of them reports trusted-path-modified HIGH)."
+    if [ "${RS_TRUSTPATH_YES:-0}" != "1" ]; then
+        if [ ! -t 0 ]; then
+            die "stdin is not a TTY - re-run with --yes to confirm trusting this path non-interactively."
+        fi
+        printf 'Trust this path? [y/N] '
+        read -r ans
+        case "$ans" in y|Y|yes|YES) : ;; *) die "Aborted. Nothing was trusted." ;; esac
+    fi
+
+    mkdir -p "$RS_HOME/trusted-manifests"
+    local slug; slug="$(printf '%s' "$rel" | tr '/ ' '__')"
+    local manifest="$RS_HOME/trusted-manifests/$slug.manifest"
+    _rs_trustpath_manifest "$target" "$filelist" > "$manifest"
+    chmod 600 "$manifest" 2>/dev/null
+
+    local combined; combined="$(sort "$manifest" | sha256sum 2>/dev/null | awk '{print $1}')"
+    [ -n "$combined" ] || combined="$(sort "$manifest" | shasum -a 256 2>/dev/null | awk '{print $1}')"
+    [ -n "$combined" ] || die "Could not compute a hash (need sha256sum or shasum)."
+
+    touch "$RS_HOME/trusted-paths.conf"
+    local tmpconf; tmpconf="$(rs_tmp trustpath-conf-new)"
+    awk -F'|' -v R="$rel" '$1=="TRUSTEDPATH" && $2==R { next } { print }' "$RS_HOME/trusted-paths.conf" > "$tmpconf"
+    printf 'TRUSTEDPATH|%s|%s|%s\n' "$rel" "$combined" "$slug" >> "$tmpconf"
+    cp "$tmpconf" "$RS_HOME/trusted-paths.conf"
+    chmod 600 "$RS_HOME/trusted-paths.conf" 2>/dev/null
+    ok "Trusted: $rel ($n file(s), manifest hash $combined)"
+}
+
+# _rs_trustpath_prescan: validates every ~/.ratsweepr/trusted-paths.conf entry
+# against its stored per-file manifest. A path whose combined hash still
+# matches has every one of its files merged into $VERIFIED (same "don't
+# flag this" mechanism a checksum-verified core/plugin file already gets) and
+# counted into one INFO line. A path whose hash DIFFERS is never silently
+# re-trusted - every file whose own hash changed (or that's new/missing) is
+# reported as trusted-path-modified HIGH with the manifest's old hash (empty
+# for a newly-added file) and the current one.
+_rs_trustpath_prescan() {
+    [ -s "$RS_HOME/trusted-paths.conf" ] || return 0
+    local type rel storedhash slug skipped=0
+    while IFS='|' read -r type rel storedhash slug; do
+        [ "$type" = "TRUSTEDPATH" ] || continue
+        [ -n "$rel" ] || continue
+        local target="$WPROOT/$rel"
+        if [ ! -e "$target" ]; then
+            warn "trust-path '$rel' no longer exists under this WordPress root - skipping"
+            continue
+        fi
+        local manifest="$RS_HOME/trusted-manifests/$slug.manifest"
+        if [ ! -s "$manifest" ]; then
+            warn "trust-path '$rel' has no stored manifest - re-run: ratsweepr.sh trust-path $rel"
+            continue
+        fi
+        local filelist; filelist="$(rs_tmp trustcheck-files)"
+        _rs_trustpath_filelist "$target" > "$filelist"
+        local curmanifest; curmanifest="$(rs_tmp trustcheck-curmanifest)"
+        _rs_trustpath_manifest "$target" "$filelist" > "$curmanifest"
+        local newcombined; newcombined="$(sort "$curmanifest" | sha256sum 2>/dev/null | awk '{print $1}')"
+        [ -n "$newcombined" ] || newcombined="$(sort "$curmanifest" | shasum -a 256 2>/dev/null | awk '{print $1}')"
+
+        if [ -n "$newcombined" ] && [ "$newcombined" = "$storedhash" ]; then
+            local relf
+            while IFS=$'\t' read -r relf _; do
+                [ -n "$relf" ] || continue
+                if [ -d "$target" ]; then printf '%s\n' "$rel/$relf"; else printf '%s\n' "$rel"; fi
+            done < "$curmanifest" >> "$VERIFIED"
+            skipped=$((skipped + $(wc -l < "$curmanifest" | tr -d ' ')))
+        else
+            local oldsorted; oldsorted="$(rs_tmp trustcheck-old)"
+            sort "$manifest" > "$oldsorted"
+            local newsorted; newsorted="$(rs_tmp trustcheck-new)"
+            sort "$curmanifest" > "$newsorted"
+            # Per-file old/new hash: join on the relative-filename column.
+            awk -F'\t' '
+                NR==FNR { old[$1]=$2; next }
+                { new[$1]=$2; seen[$1]=1 }
+                END {
+                    for (f in old) if (!(f in new)) printf "%s\t%s\t(removed)\n", f, old[f]
+                    for (f in new) {
+                        if (!(f in old)) printf "%s\t(new file)\t%s\n", f, new[f]
+                        else if (old[f] != new[f]) printf "%s\t%s\t%s\n", f, old[f], new[f]
+                    }
+                }' "$oldsorted" "$newsorted" \
+            | while IFS=$'\t' read -r relf oldh newh; do
+                [ -n "$relf" ] || continue
+                local changedrel; [ -d "$target" ] && changedrel="$rel/$relf" || changedrel="$rel"
+                report "HIGH" "trusted-path-modified" "$changedrel" \
+                    "content changed since 'trust-path $rel' was run - old=$oldh new=$newh - re-verify by hand and re-run trust-path if legitimate"
+            done
+        fi
+    done < "$RS_HOME/trusted-paths.conf"
+    [ "$skipped" -gt 0 ] 2>/dev/null && report "INFO" "trusted-path-skip" "-" "$skipped files skipped (trusted by hash)"
 }
 
 # =============================== SCANNERS =====================================
@@ -729,6 +993,10 @@ scan_core_orphans() {
             rel="${f#"$WPROOT"/}"
             grep -Fq $'\tcore-unknown-file\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
             grep -Fq $'\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
+            if [ "$base" = "wordfence-waf.php" ] && _rs_is_wordfence_waf_bootstrap_legit "$f"; then
+                report "INFO" "core-orphan-file" "$rel" "allowlisted: standard Wordfence WAF bootstrap shim (content-verified) [suppressed:wordfence-waf-bootstrap]"
+                continue
+            fi
             report "HIGH" "core-orphan-file" "$rel" "unexpected PHP at WordPress root (not a stock core file) - verify manually (cleanup: RatSweepr Cleanup Kit / Done-For-You at ratsweepr.com)"
         ;; esac
     done < "$root_list"
@@ -898,7 +1166,12 @@ scan_core_checksums() {
     while IFS= read -r extra; do
         case "$extra" in
             *.php|*.php[0-9]|*.phtml|*.phar)
-                report "HIGH" "core-unknown-file" "$extra" "unexpected executable PHP in core area, not in official $WPVER manifest";;
+                if [ "$(basename -- "$extra")" = "wordfence-waf.php" ] \
+                   && _rs_is_wordfence_waf_bootstrap_legit "$WPROOT/$extra"; then
+                    report "INFO" "core-unknown-file" "$extra" "allowlisted: standard Wordfence WAF bootstrap shim (file_exists + define + include_once of the plugin's own waf/bootstrap.php, content-verified) [suppressed:wordfence-waf-bootstrap]"
+                else
+                    report "HIGH" "core-unknown-file" "$extra" "unexpected executable PHP in core area, not in official $WPVER manifest"
+                fi;;
             */.htaccess|.htaccess)
                 # An unexpected .htaccess in a core dir warrants inspection. Two malware
                 # tells make it HIGH: (a) the 'suspected' extension token (blocks access
@@ -1059,8 +1332,27 @@ scan_plugin_header_mismatch() {
                 "WordPress.org Community"|"WordPress"|"Automattic")
                     case "$known_automattic" in
                         *"|$slug|"*) : ;;
-                        *) hits=$((hits+1))
-                           detail="${detail}Author claims '$author' but '$slug' isn't a known Automattic/core plugin; " ;;
+                        *)
+                            # RATSWEEPR-009/R1: the claim is only HIGH when it's
+                            # actually checkable and wrong. A plugin that just
+                            # passed checksum verification against
+                            # wordpress.org (so it's genuinely on wp.org under
+                            # this slug), or a slug on the data-file list of
+                            # known official premium packages that never had
+                            # checksums to begin with, downgrades to an
+                            # auditable INFO instead of counting as a hit.
+                            local verified_plugin=0 official_listed=0
+                            grep -Fq "wp-content/plugins/$slug/" "$VERIFIED" 2>/dev/null && verified_plugin=1
+                            awk -F'|' -v S="$slug" '$1=="OFFICIALSLUG" && $2==S{found=1} END{exit !found}' "$PATTERNS_FILE" 2>/dev/null && official_listed=1
+                            if [ "$verified_plugin" = "1" ]; then
+                                report "INFO" "plugin-header-mismatch" "wp-content/plugins/$slug" "allowlisted: Author claims '$author' but files passed checksum verification against wordpress.org (slug is genuinely on wp.org) [suppressed:author-claim-verified]"
+                            elif [ "$official_listed" = "1" ]; then
+                                report "INFO" "plugin-header-mismatch" "wp-content/plugins/$slug" "allowlisted: Author claims '$author' but '$slug' is on the known official-premium-slug list (never had wp.org checksums to verify against) [suppressed:author-claim-verified]"
+                            else
+                                hits=$((hits+1))
+                                detail="${detail}Author claims '$author' but '$slug' isn't a known Automattic/core plugin; "
+                            fi
+                            ;;
                     esac ;;
             esac
         fi
@@ -1152,12 +1444,13 @@ scan_mu_plugins() {
     # unknown mu-plugin is surfaced even if no content rule matches it.
     local mud="$WPROOT/wp-content/mu-plugins"
     [ -d "$mud" ] || return
-    # Known-legitimate mu-plugin entries (host loaders). Extend via ALLOWPATH if needed.
-    # Known-legit host/vendor mu-plugins. These are real files from managed hosts
-    # and reputable tools that auto-load by design; flagging them is noise. Any file
-    # here still goes through the YARA/heuristic content scan, so a tampered copy is
-    # caught by content even though its name is allowlisted.
-    local known="|kinsta-mu-plugins.php|index.php|wp-migrate-db-pro-compatibility.php|0-worker.php|wpengine-common.php|wpe-wp-sign-on-plugin.php|mu-plugin.php|slt-force-strong-passwords.php|"
+    # Known-legit GENERIC mu-plugin filenames (no hosting-brand names here -
+    # RATSWEEPR-009/R6: a host-managed mu-plugin is recognized by hash
+    # (allowlist_hash_check / `trust-path`) or by structure
+    # (scan_managed_mu_plugin_structural), never by a brand baked into this
+    # list - a name match alone used to let an attacker who knew a host's
+    # loader filename slip a tampered file straight past this check).
+    local known="|index.php|wp-migrate-db-pro-compatibility.php|0-worker.php|mu-plugin.php|slt-force-strong-passwords.php|"
     local f base rel hash
     for f in "$mud"/*.php; do
         [ -f "$f" ] || continue
@@ -1175,15 +1468,41 @@ scan_mu_plugins() {
         case "$known" in *"|$base|"*) continue;; esac
         # allow anything already covered by an ALLOWPATH trusted-vendor prefix
         if allowpath_check "$rel"; then continue; fi
-        # WP Engine's per-install helper mu-plugins are named wpe_<hash>_private_ips.php
-        # (legit IP-whitelist helpers). Exempt that exact shape ONLY if the file does
-        # not trip a content red flag - a backdoor named to mimic it still fires.
-        if printf '%s' "$base" | grep -qE '^wpe_[a-z0-9]+_private_ips\.php$' \
-           && ! grep -qiE 'eval|base64_decode|system|passthru|\$_(GET|POST|REQUEST|COOKIE)|assert|gzinflate' "$f" 2>/dev/null; then
-            continue
-        fi
+        # trust-path (RATSWEEPR-009/R6): a path the operator explicitly
+        # verified and trusted by hash is merged into $VERIFIED during
+        # _rs_trustpath_prescan(), so it's skipped here the same way a
+        # checksum-verified file is.
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
         report "HIGH" "mu-plugin-unexpected" "$rel" \
             "unexpected must-use plugin - mu-plugins auto-load invisibly on every request and are a common backdoor location; verify manually (cleanup: RatSweepr Cleanup Kit / Done-For-You at ratsweepr.com)"
+    done
+}
+
+# scan_managed_mu_plugin_structural (RATSWEEPR-009/R6): recognizes a
+# host-managed mu-plugin tree by SHAPE, never by brand - a loader file
+# directly in mu-plugins/ plus a same-named directory holding its own
+# vendor/composer/ and a bootstrap.php. This never downgrades the HIGH from
+# scan_mu_plugins above; it only adds an INFO hint pointing at `trust-path`
+# when the loader content itself carries no network/exec red flag.
+scan_managed_mu_plugin_structural() {
+    local mud="$WPROOT/wp-content/mu-plugins"
+    [ -d "$mud" ] || return
+    local f base stem dir rel
+    for f in "$mud"/*.php; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        stem="${base%.php}"
+        dir="$mud/$stem"
+        [ -d "$dir" ] || continue
+        [ -d "$dir/vendor/composer" ] || continue
+        [ -f "$dir/bootstrap.php" ] || continue
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        if grep -qiE 'eval[[:space:]]*\(|base64_decode|system[[:space:]]*\(|passthru[[:space:]]*\(|shell_exec|curl_exec|fsockopen|\$_(GET|POST|REQUEST|COOKIE)' "$f" 2>/dev/null; then
+            continue
+        fi
+        report "INFO" "managed-mu-plugin" "$rel" \
+            "structurally looks like a host-managed mu-plugin loader (matching wp-content/mu-plugins/$stem/vendor/composer + bootstrap.php) - run: ratsweepr.sh trust-path wp-content/mu-plugins/$stem   to silence by content hash"
     done
 }
 
@@ -1287,6 +1606,56 @@ _rs_is_uploads_php_stub() {
     printf '%s' "$stripped" | grep -qE '^<\?php(exit(\(\))?;?|die(\(\))?;?|return;?)?$'
 }
 
+# _rs_is_404_stub FILE (RATSWEEPR-009/R1): true only if, with comments/whitespace
+# stripped, FILE is nothing but one or more header(...) calls whose argument is
+# an HTTP 404 status line, plus an optional bare exit/die - e.g. the common
+# "silence this directory, return a real 404 to anyone poking at it" guard.
+# Any other statement (an echo, a require, an assignment) fails this check.
+_rs_is_404_stub() {
+    local f="$1" sz stripped
+    sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
+    [ "$sz" -le 400 ] 2>/dev/null || return 1
+    stripped="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
+        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
+        | tr -d '[:space:]')"
+    printf '%s' "$stripped" \
+        | grep -qE '^<\?php(header\(["'"'"'][^"'"'"']*404[^"'"'"']*["'"'"']\);?)+(exit(\(\))?;?|die(\(\))?;?)?$'
+}
+
+# _rs_is_data_only_php FILE (RATSWEEPR-009/R1): true only if, once comments and
+# whitespace are stripped, FILE's token stream contains NOTHING but <?php, a
+# standard ABSPATH guard, and bare scalar/array variable assignments (string,
+# number, array-literal) - no function/method call of any kind, no
+# include/require, no backticks, no superglobal use, no eval/assert/
+# base64_decode/gzinflate/str_rot13/create_function anywhere. This is exactly
+# the shape of a PDF library's font-definition file ($type=...; $name=...;
+# $cw=[...];) - conservative text/regex, not a real PHP parser (php may be
+# absent on a shared host), so ANY construct outside that short allowlist
+# falls through to the HIGH below rather than risk clearing real code.
+_rs_is_data_only_php() {
+    local f="$1" sz body
+    sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
+    [ "$sz" -le 2000000 ] 2>/dev/null || return 1
+    grep -qE '<\?php|<\?=' "$f" 2>/dev/null || return 1
+    # Hard disqualifiers anywhere in the file - a single match of any of these
+    # means it is NOT data-only, full stop.
+    grep -qiE '\$_(GET|POST|REQUEST|COOKIE|SERVER)\b|`|\beval[[:space:]]*\(|\bassert[[:space:]]*\(|base64_decode|gzinflate|gzuncompress|str_rot13|create_function|\b(include|require)(_once)?\b' "$f" 2>/dev/null \
+        && return 1
+    body="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
+        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g')"
+    # Strip the one allowed function-looking construct (the ABSPATH guard)
+    # before checking for "any function call at all", then strip every bare
+    # scalar/array assignment statement; whatever is left must be nothing but
+    # <?php/?>, whitespace and semicolons - any leftover token is a call,
+    # control structure, or something else this check doesn't recognize.
+    local scrubbed
+    scrubbed="$(printf '%s' "$body" \
+        | sed -E "s/if[[:space:]]*\([[:space:]]*!?[[:space:]]*defined[[:space:]]*\([[:space:]]*['\"]ABSPATH['\"][[:space:]]*\)[[:space:]]*\)[[:space:]]*(\{[[:space:]]*)?exit;?(\})?/;/g" \
+        | sed -E "s/\\\$[A-Za-z_][A-Za-z0-9_]*(\[[^]=]*\])?[[:space:]]*=[[:space:]]*(array[[:space:]]*\([^;]*\)|\[[^;]*\]|['\"][^;]*['\"]|-?[0-9.]+|true|false|null)[[:space:]]*;//Ig" \
+        | tr -d '[:space:];' | sed -E 's/<\?php//; s/\?>$//')"
+    [ -z "$scrubbed" ]
+}
+
 scan_uploads_php() {
     info "Scanning wp-content/uploads for PHP files (should contain none)..."
     [ -d "$WPROOT/wp-content/uploads" ] || return
@@ -1296,7 +1665,11 @@ scan_uploads_php() {
     while IFS= read -r -d '' f; do
         rel="${f#"$WPROOT"/}"
         if _rs_is_uploads_php_stub "$f"; then
-            report "INFO" "php-in-uploads" "$rel" "empty PHP stub (<?php + optional bare exit/die/return, <=220 bytes) - benign, no executable code"
+            report "INFO" "php-in-uploads" "$rel" "empty PHP stub (<?php + optional bare exit/die/return, <=220 bytes) - benign, no executable code [suppressed:benign-silence-guard]"
+        elif _rs_is_404_stub "$f"; then
+            report "INFO" "php-in-uploads" "$rel" "benign silence guard: only header(...) calls sending an HTTP 404, plus optional exit/die - no executable payload [suppressed:benign-silence-guard]"
+        elif _rs_is_data_only_php "$f"; then
+            report "INFO" "php-in-uploads" "$rel" "data-only PHP (font/config definition): only scalar/array variable assignments, no calls/includes/superglobals/eval/decode constructs [suppressed:data-only-php]"
         else
             report "HIGH" "php-in-uploads" "$rel" "executable PHP inside uploads - almost always malicious"
         fi
@@ -1372,6 +1745,639 @@ scan_asset_tampering() {
         fi
     done < "$assetlist"
     ok "Asset tampering check done."
+}
+
+# ===================== RATSWEEPR-009/R2: PERSISTENCE FAMILY ====================
+# A cluster of detections written after static review of a real removed
+# toolkit (never executed, never committed here - see the ratsweepr.sh
+# report-back for this ticket). Every name/host/class/option list below is
+# DATA (patterns.conf / iocs.conf), easy to extend without touching code.
+
+# _rs_container_excluded REL -> 0 if REL matches a CONTAINEREXCLUDE glob in
+# patterns.conf (ships empty - add your own confirmed benign-large-file
+# exceptions there, never by editing this function).
+_rs_container_excluded() {
+    local rel="$1" type glob
+    while IFS='|' read -r type glob; do
+        [ "$type" = "CONTAINEREXCLUDE" ] || continue
+        case "$rel" in $glob) return 0 ;; esac
+    done < "$PATTERNS_FILE"
+    return 1
+}
+
+# scan_payload_containers: a disguised-payload container is a single short
+# line - tag:semver:md5:H4sI<gzip+base64> - or any standalone line over 50KB
+# that's almost entirely base64 alphabet and starts with the gzip-in-base64
+# magic "H4sI". NEVER decoded into memory beyond a length check (gzip -dc,
+# discarding the output, reported as a byte count only) and NEVER executed.
+scan_payload_containers() {
+    [ -d "$WPROOT/wp-content" ] || return
+    info "Checking for disguised-payload containers (gzip+base64 blobs)..."
+    local flist; flist="$(rs_tmp payload-container-files)"
+    find "$WPROOT/wp-content" \( -path "$WPROOT/wp-content/cache" -o -path "$RS_KIT_DIR" \
+                                  -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
+         -type f -print0 2>/dev/null > "$flist"
+    local f rel sz firstbytes
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        case "$rel" in
+            wp-content/uploads/*.jpg|wp-content/uploads/*.jpeg|wp-content/uploads/*.png| \
+            wp-content/uploads/*.gif|wp-content/uploads/*.webp|wp-content/uploads/*.svg) continue;;
+        esac
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        _rs_container_excluded "$rel" && continue
+        sz="$(wc -c < "$f" 2>/dev/null || echo 0)"
+        [ "$sz" -gt 0 ] 2>/dev/null || continue
+        [ "$sz" -le 10000000 ] 2>/dev/null || continue
+
+        firstbytes="$(head -c 2000 "$f" 2>/dev/null | LC_ALL=C tr -d '\000')"
+        if printf '%s' "$firstbytes" | LC_ALL=C grep -qE '^[A-Z]{2,5}[0-9]:[0-9]+\.[0-9]+\.[0-9]+:[0-9a-f]{32}:H4sI'; then
+            local declen=""
+            if have gzip; then
+                declen="$(printf '%s' "$firstbytes" | sed -E 's/^[A-Z]{2,5}[0-9]:[0-9]+\.[0-9]+\.[0-9]+:[0-9a-f]{32}://' \
+                    | { base64 -d 2>/dev/null || base64 -D 2>/dev/null || openssl base64 -d -A 2>/dev/null; } \
+                    | gzip -dc 2>/dev/null | wc -c | tr -d ' ')"
+            fi
+            report "HIGH" "payload-container" "$rel" "matches the disguised-payload-container shape (TAG:version:md5:H4sI<gzip+base64>) - content NOT decoded or printed by this scan${declen:+; decoded length would be ~$declen byte(s)}; quarantine, never execute"
+            continue
+        fi
+
+        local longline
+        longline="$(LC_ALL=C awk '{ if (length($0) > 50000) { print; exit } }' "$f" 2>/dev/null)"
+        if [ -n "$longline" ]; then
+            case "$longline" in
+                H4sI*)
+                    local llen b64len pct
+                    llen="${#longline}"
+                    b64len="$(printf '%s' "$longline" | LC_ALL=C tr -dc 'A-Za-z0-9+/=' | wc -c | tr -d ' ')"
+                    pct=$(( llen > 0 ? b64len * 100 / llen : 0 ))
+                    if [ "$pct" -ge 95 ] 2>/dev/null; then
+                        report "HIGH" "payload-container" "$rel" "single line over 50KB, ${pct}% base64 alphabet, starts with the gzip-in-base64 magic 'H4sI' - content NOT decoded or printed by this scan; quarantine, never execute"
+                    fi
+                    ;;
+            esac
+        fi
+    done < "$flist"
+    ok "Payload-container check done."
+}
+
+# scan_disguised_data_php: a file under wp-content with a data-looking
+# extension (.dat/.lkg/.cache/.tmp/.log/.txt/.csv/.json) whose content is
+# actually PHP (starts with <?php, allowing a leading BOM/whitespace, or
+# carries a plugin-header block anywhere in the file) - the ".dat sibling"
+# restore-source half of the same dropper family as scan_payload_containers.
+scan_disguised_data_php() {
+    [ -d "$WPROOT/wp-content" ] || return
+    info "Checking for PHP disguised with a data-file extension..."
+    local flist; flist="$(rs_tmp disguised-data-files)"
+    find "$WPROOT/wp-content" \( -path "$WPROOT/wp-content/cache" -o -path "$RS_KIT_DIR" \
+                                  -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
+         -type f \( -iname '*.dat' -o -iname '*.lkg' -o -iname '*.cache' -o -iname '*.tmp' \
+                    -o -iname '*.log' -o -iname '*.txt' -o -iname '*.csv' -o -iname '*.json' \) \
+         -print0 2>/dev/null > "$flist"
+    local f rel head64 bom disguised
+    bom=$'\xEF\xBB\xBF'
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        _rs_container_excluded "$rel" && continue
+        head64="$(dd if="$f" bs=1 count=64 2>/dev/null | LC_ALL=C tr -d '\000')"
+        head64="${head64#"$bom"}"
+        disguised=0
+        printf '%s' "$head64" | LC_ALL=C grep -qE '^[[:space:]]*<\?php' && disguised=1
+        if [ "$disguised" = "0" ] && grep -qF '<?php' "$f" 2>/dev/null \
+           && grep -qiE '^[[:space:]*/]*Plugin Name[[:space:]]*:' "$f" 2>/dev/null; then
+            disguised=1
+        fi
+        [ "$disguised" = "1" ] || continue
+        report "HIGH" "php-disguised-as-data" "$rel" "file has a data-file extension (.${rel##*.}) but its content is PHP (starts with <?php, or carries a plugin-header block) - disguised payload; quarantine, never open directly"
+    done < "$flist"
+    ok "Disguised-data-PHP check done."
+}
+
+# scan_suffix_family: the family naming scheme - <word>-<8hex>.php/.dat/.lkg,
+# the SAME 8-hex suffix reused across many directories - plus a fake plugin
+# dir named <real-or-impersonated-slug>-<8hex>. Flags every member once the
+# suffix is seen in >=3 distinct directories (the family id is printed once).
+scan_suffix_family() {
+    [ -d "$WPROOT/wp-content" ] || return
+    info "Checking for a shared 8-hex persistence-family suffix..."
+    local flist; flist="$(rs_tmp suffix-family-files)"
+    find "$WPROOT/wp-content" \( -path "$RS_KIT_DIR" -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
+         -type f \( -iname '*-????????.php' -o -iname '*-????????.dat' -o -iname '*-????????.lkg' \) \
+         -print0 2>/dev/null > "$flist"
+    local f rel base suffix
+    local hits; hits="$(rs_tmp suffix-family-hits)"; : > "$hits"
+    while IFS= read -r -d '' f; do
+        base="$(basename -- "$f")"
+        suffix="$(printf '%s' "$base" | grep -ioE '[0-9a-f]{8}\.(php|dat|lkg)$' | grep -ioE '^[0-9a-f]{8}' | tr '[:upper:]' '[:lower:]')"
+        [ -n "$suffix" ] || continue
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        printf '%s\t%s\n' "$suffix" "$rel" >> "$hits"
+    done < "$flist"
+
+    if [ -d "$WPROOT/wp-content/plugins" ]; then
+        local plugdir pslug dirsuffix base_slug known realdir
+        for plugdir in "$WPROOT"/wp-content/plugins/*/; do
+            [ -d "$plugdir" ] || continue
+            pslug="$(basename -- "$plugdir")"
+            dirsuffix="$(printf '%s' "$pslug" | grep -ioE -- '-[0-9a-f]{8}$' | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+            [ -n "$dirsuffix" ] || continue
+            base_slug="${pslug%-*}"
+            known=0
+            for realdir in "$WPROOT"/wp-content/plugins/*/; do
+                [ "$(basename -- "$realdir")" = "$base_slug" ] && known=1 && break
+            done
+            if [ "$known" = "0" ]; then
+                awk -F'|' -v S="$base_slug" '$1=="IMPERSONATEDSLUG" && $2==S{f=1} END{exit !f}' "$PATTERNS_FILE" 2>/dev/null && known=1
+            fi
+            [ "$known" = "1" ] || continue
+            printf '%s\t%s\n' "$dirsuffix" "wp-content/plugins/$pslug" >> "$hits"
+        done
+    fi
+
+    [ -s "$hits" ] || { ok "Suffix-family check done (no hits)."; return; }
+    local suffixlist; suffixlist="$(rs_tmp suffix-family-suffixes)"
+    cut -f1 "$hits" | sort -u > "$suffixlist"
+    local sfx dircount
+    while IFS= read -r sfx; do
+        [ -n "$sfx" ] || continue
+        dircount="$(awk -F'\t' -v S="$sfx" '$1==S{print $2}' "$hits" | sed -E 's#/[^/]*$##' | sort -u | wc -l | tr -d ' ')"
+        [ "$dircount" -ge 3 ] 2>/dev/null || continue
+        awk -F'\t' -v S="$sfx" '$1==S{print $2}' "$hits" | sort -u | while IFS= read -r rel; do
+            report "HIGH" "suffix-family" "$rel" "shares the 8-hex family suffix '$sfx' with files/dirs in $dircount different directories - persistence-family naming pattern (family id: $sfx)"
+        done
+    done < "$suffixlist"
+    ok "Suffix-family check done."
+}
+
+# scan_hidden_dir_php: PHP files inside dot-directories under wp-content,
+# excluding a short data-file allowlist of vendored dev-tooling dirs
+# (DEVDIRALLOW in patterns.conf). Structural (any dot-dir qualifies), not
+# keyed to any specific attacker-chosen name.
+scan_hidden_dir_php() {
+    local wcroot="$WPROOT/wp-content"
+    [ -d "$wcroot" ] || return
+    info "Checking for PHP inside dot-directories under wp-content..."
+    local dirs; dirs="$(rs_tmp hidden-dirs)"
+    find "$wcroot" \( -path "$RS_KIT_DIR" -o -path "$RS_CACHE" -o -path "$RS_REPORT_DIR" \) -prune -o \
+         -type d -name '.*' -print 2>/dev/null > "$dirs"
+    local d rel phpcount
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        rel="${d#"$WPROOT"/}"
+        _rs_hidden_dir_allowed "$rel" && continue
+        phpcount="$(find "$d" -maxdepth 6 -type f -name '*.php' 2>/dev/null | wc -l | tr -d ' ')"
+        [ "$phpcount" -gt 0 ] 2>/dev/null || continue
+        report "HIGH" "hidden-dir-php" "$rel" "$phpcount PHP file(s) inside a dot-directory under wp-content - hidden from normal directory listings, a common persistence hideout; review"
+    done < "$dirs"
+    ok "Hidden-dir-PHP check done."
+}
+# _rs_hidden_dir_allowed REL -> 0 if REL matches a DEVDIRALLOW entry
+# (patterns.conf) - a short, extensible, non-brand list of vendored dev-tool
+# directory names (RATSWEEPR-009/R2's examples: .git, .github, .husky,
+# .vscode, .idea, node_modules/.bin, .well-known).
+_rs_hidden_dir_allowed() {
+    local rel="$1" type glob
+    while IFS='|' read -r type glob; do
+        [ "$type" = "DEVDIRALLOW" ] || continue
+        case "$rel" in *"$glob"|*"$glob"/*) return 0 ;; esac
+    done < "$PATTERNS_FILE"
+    return 1
+}
+
+# scan_fake_plugin_header: a plugin whose Plugin Name/Author matches the
+# FAKEPLUGINNAME/FAKEPLUGINAUTHOR data list is MED alone (plausible names
+# can exist for real products) and HIGH only once a second, independent
+# signal corroborates it. Never flags a checksum-verified plugin by name/
+# author alone - must run AFTER scan_suffix_family/scan_hidden_dir_php/
+# scan_external_script_enqueue/scan_db_option_iocs so it can see their hits.
+scan_fake_plugin_header() {
+    [ -d "$WPROOT/wp-content/plugins" ] || return
+    info "Checking plugin headers against the known fake-plugin name/author list..."
+    local plugdir slug mainfile f line pname pauthor hit why
+    for plugdir in "$WPROOT"/wp-content/plugins/*/; do
+        [ -d "$plugdir" ] || continue
+        slug="$(basename -- "$plugdir")"
+        mainfile=""
+        for f in "$plugdir"*.php; do
+            [ -f "$f" ] || continue
+            grep -qiE '^[[:space:]*/]*Plugin Name:' "$f" 2>/dev/null || continue
+            mainfile="$f"; break
+        done
+        [ -n "$mainfile" ] || continue
+        line="$(grep -iE '^[[:space:]*/]*Plugin Name:' "$mainfile" | head -1)"
+        pname="$(printf '%s' "${line#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        line="$(grep -iE '^[[:space:]*/]*Author:' "$mainfile" | head -1)"
+        pauthor="$(printf '%s' "${line#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+        hit=0; why=""
+        if [ -n "$pname" ] && awk -F'|' -v N="$pname" '$1=="FAKEPLUGINNAME" && $2==N{f=1} END{exit !f}' "$PATTERNS_FILE" 2>/dev/null; then
+            hit=1; why="Plugin Name '$pname' matches a known fake-plugin name"
+        fi
+        if [ -n "$pauthor" ] && awk -F'|' -v A="$pauthor" '$1=="FAKEPLUGINAUTHOR" && $2==A{f=1} END{exit !f}' "$PATTERNS_FILE" 2>/dev/null; then
+            hit=1; why="${why:+$why; }Author '$pauthor' matches a known fake-plugin author"
+        fi
+        [ "$hit" = "1" ] || continue
+
+        if grep -Fq "wp-content/plugins/$slug/" "$VERIFIED" 2>/dev/null; then
+            report "INFO" "fake-plugin-header" "wp-content/plugins/$slug" "allowlisted: $why, but the plugin's files passed checksum verification against wordpress.org [suppressed:checksum-verified-plugin]"
+            continue
+        fi
+
+        local second=0 secwhy=""
+        grep -Fq $'\tsuffix-family\t'"wp-content/plugins/$slug" "$REPORT" 2>/dev/null && { second=1; secwhy="suffix-family"; }
+        grep -Fq $'\tplugin-modified\t'"wp-content/plugins/$slug/" "$REPORT" 2>/dev/null && { second=1; secwhy="${secwhy:+$secwhy,}checksum-failed"; }
+        find "$plugdir" -maxdepth 4 -type d -name '.*' 2>/dev/null | grep -q . && { second=1; secwhy="${secwhy:+$secwhy,}hidden-dir-copy"; }
+        find "$plugdir" -maxdepth 2 -type f -iname '*.dat' 2>/dev/null | grep -q . && { second=1; secwhy="${secwhy:+$secwhy,}dat-sibling"; }
+        grep -Fq $'\texternal-script-enqueue\t'"wp-content/plugins/$slug" "$REPORT" 2>/dev/null && { second=1; secwhy="${secwhy:+$secwhy,}external-enqueue"; }
+        grep -Fq $'\tdb-option-ioc\t' "$REPORT" 2>/dev/null && { second=1; secwhy="${secwhy:+$secwhy,}option-ioc"; }
+
+        if [ "$second" = "1" ]; then
+            report "HIGH" "fake-plugin-header" "wp-content/plugins/$slug" "$why; corroborated by a second signal ($secwhy) - review and quarantine"
+        else
+            report "MED" "fake-plugin-header" "wp-content/plugins/$slug" "$why - header alone, no corroborating signal yet; review"
+        fi
+    done
+    ok "Fake-plugin-header check done."
+}
+
+# scan_class_iocs: PHP files declaring a class name on the CLASSIOC list, or
+# referencing a literal option name on the OPTIONREFIOC list (patterns.conf).
+scan_class_iocs() {
+    info "Checking for known persistence-family class/option-reference names..."
+    # Bounded work (RATSWEEPR-009 hygiene): ONE batch `xargs grep -l` pass per
+    # pattern across the whole file list (the same convention scan_heuristics/
+    # scan_nulled already use), not a per-file loop re-reading patterns.conf
+    # and forking grep for every (file, pattern) pair - that shape is what
+    # made this check take several seconds even on a few-thousand-file site.
+    local type name hitlist; hitlist="$(rs_tmp class-ioc-hits)"
+    local f rel
+    while IFS='|' read -r type name; do
+        case "$type" in
+            CLASSIOC)
+                { xargs -0 grep -lE --null -e "class[[:space:]]+$name\\b" < "$PHPLIST" 2>/dev/null || true; } > "$hitlist"
+                while IFS= read -r -d '' f; do
+                    rel="${f#"$WPROOT"/}"
+                    grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+                    # item carries the matched name (not just $rel) - finalize_report's
+                    # generic dedup collapses same-severity/item/category rows, and a
+                    # single file can legitimately trip BOTH a CLASSIOC and an
+                    # OPTIONREFIOC hit; without this they'd silently collapse to one.
+                    report "HIGH" "class-ioc" "$rel (class:$name)" "declares class $name - matches the persistence-family class-name IOC list"
+                done < "$hitlist"
+                ;;
+            OPTIONREFIOC)
+                { xargs -0 grep -lF --null -e "$name" < "$PHPLIST" 2>/dev/null || true; } > "$hitlist"
+                while IFS= read -r -d '' f; do
+                    rel="${f#"$WPROOT"/}"
+                    grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+                    report "HIGH" "class-ioc" "$rel (option:$name)" "references option '$name' - matches the persistence-family option-reference IOC list"
+                done < "$hitlist"
+                ;;
+        esac
+    done < "$PATTERNS_FILE"
+    ok "Class/option-reference IOC check done."
+}
+
+# scan_db_option_iocs: wp_options rows whose NAME matches a DBOPTIONPREFIX
+# glob (patterns.conf) AND has a non-empty value, plus cron hooks (parsed as
+# TEXT out of the serialized cron option, never unserialize/eval) registered
+# under the same prefixes. Read-only: prints the copy-paste delete commands,
+# clearly marked as not run.
+scan_db_option_iocs() {
+    _rs_db_scan_allowed || return
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    info "Checking wp_options for persistence-family option-name/cron-hook IOC prefixes..."
+    local type glob sqlglob
+    while IFS='|' read -r type glob; do
+        [ "$type" = "DBOPTIONPREFIX" ] || continue
+        sqlglob="$(printf '%s' "$glob" | sed 's/\*/%/g')"
+        db_query "SELECT option_name, LENGTH(option_value) FROM ${P}options WHERE option_name LIKE '$sqlglob' AND option_value != '' LIMIT 100;" \
+        | while IFS=$'\t' read -r name len; do
+            [ -n "$name" ] || continue
+            report "HIGH" "db-option-ioc" "option:$name" "option name matches the persistence-family prefix '$glob' and has a non-empty value ($len byte(s)) - copy-paste (NOT run): wp option delete $name"
+        done
+    done < "$PATTERNS_FILE"
+
+    local cronval; cronval="$(db_query "SELECT option_value FROM ${P}options WHERE option_name='cron';")"
+    [ -n "$cronval" ] || { ok "DB option-IOC check done."; return; }
+    local hooks; hooks="$(rs_tmp dbopt-cron-hooks)"
+    printf '%s' "$cronval" | grep -oE '"[A-Za-z0-9_]+";a:[0-9]+:\{s:32:' | sed -E 's/^"//; s/";.*$//' | sort -u > "$hooks"
+    local hook hookglob
+    while IFS= read -r hook; do
+        [ -n "$hook" ] || continue
+        while IFS='|' read -r type glob; do
+            [ "$type" = "DBOPTIONPREFIX" ] || continue
+            hookglob="${glob%\*}"
+            case "$hook" in "$hookglob"*)
+                report "HIGH" "db-option-ioc" "cron-hook:$hook" "cron hook '$hook' matches the persistence-family prefix '$glob' - copy-paste (NOT run): wp cron event delete $hook"
+                ;;
+            esac
+        done < "$PATTERNS_FILE"
+    done < "$hooks"
+    ok "DB option-IOC check done."
+}
+
+# scan_network_iocs: greps files (incl. theme templates - already part of
+# $PHPLIST), options, posts/postmeta for the hostnames in iocs.conf. Never
+# fetches any of them.
+scan_network_iocs() {
+    [ -s "${IOCS_FILE:-}" ] || return
+    info "Checking files, options, posts and templates for network IOC hosts..."
+    local ioc f rel
+    local iochits; iochits="$(rs_tmp ioc-filehits)"
+    while IFS= read -r ioc; do
+        case "$ioc" in \#*|"") continue;; esac
+        { xargs -0 grep -lIF --null -e "$ioc" < "$PHPLIST" 2>/dev/null || true; } > "$iochits"
+        while IFS= read -r -d '' f; do
+            rel="${f#"$WPROOT"/}"
+            grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+            report "HIGH" "ioc-host" "$rel" "references known-malicious host '$ioc'"
+        done < "$iochits"
+    done < "$IOCS_FILE"
+
+    _rs_db_scan_allowed || { ok "Network-IOC check done."; return; }
+    { [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ]; } || { ok "Network-IOC check done."; return; }
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || { ok "Network-IOC check done."; return; }
+    while IFS= read -r ioc; do
+        case "$ioc" in \#*|"") continue;; esac
+        db_query "SELECT option_name FROM ${P}options WHERE option_value LIKE '%$ioc%' LIMIT 20;" \
+        | while IFS= read -r name; do
+            [ -n "$name" ] && report "HIGH" "ioc-host" "option:$name" "option value references known-malicious host '$ioc'"
+        done
+        db_query "SELECT ID FROM ${P}posts WHERE (post_content LIKE '%$ioc%' OR post_excerpt LIKE '%$ioc%') LIMIT 20;" \
+        | while IFS= read -r id; do
+            [ -n "$id" ] && report "HIGH" "ioc-host" "post:$id" "post content references known-malicious host '$ioc'"
+        done
+        db_query "SELECT meta_id FROM ${P}postmeta WHERE meta_value LIKE '%$ioc%' LIMIT 20;" \
+        | while IFS= read -r mid; do
+            [ -n "$mid" ] && report "HIGH" "ioc-host" "postmeta:$mid" "postmeta value references known-malicious host '$ioc'"
+        done
+    done < "$IOCS_FILE"
+    ok "Network-IOC check done."
+}
+
+# scan_external_script_enqueue: wp_enqueue_script(...) to an external host
+# inside a mu-plugin or an unverified (no-checksum) plugin. MED alone, HIGH
+# when the host is in iocs.conf.
+scan_external_script_enqueue() {
+    info "Checking for wp_enqueue_script() calls to external hosts..."
+    local f rel lno rest host ioc enqlines
+    enqlines="$(rs_tmp enqueue-lines)"
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        case "$rel" in wp-content/mu-plugins/*|wp-content/plugins/*) : ;; *) continue ;; esac
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -nE "wp_enqueue_script[[:space:]]*\([^)]*['\"]https?://" "$f" 2>/dev/null > "$enqlines"
+        while IFS=: read -r lno rest; do
+            [ -n "$lno" ] || continue
+            host="$(printf '%s' "$rest" | grep -oE "https?://[^\"' )]+" | head -1 | sed -E 's#^https?://##; s#[/:?].*##')"
+            [ -n "$host" ] || continue
+            ioc=0
+            grep -Fxq "$host" "$IOCS_FILE" 2>/dev/null && ioc=1
+            if [ "$ioc" = "1" ]; then
+                report "HIGH" "external-script-enqueue" "$rel:$lno" "wp_enqueue_script() loads a script from '$host' - a known-malicious IOC host"
+            else
+                report "MED" "external-script-enqueue" "$rel:$lno" "wp_enqueue_script() loads a script from external host '$host' inside a mu-plugin/unverified plugin - review"
+            fi
+        done < "$enqlines"
+    done < "$PHPLIST"
+    ok "External-script-enqueue check done."
+}
+
+# _rs_is_appended_after_class FILE -> 0 if FILE has more than 40 lines after
+# its last top-level closing brace, and more than 10 of those lines are
+# file-scope add_action/add_filter calls - the shape of code tacked onto a
+# legitimate plugin/theme main file after its real body ends (the real-world
+# incident this ticket is based on: ~238 lines appended twice after a
+# class_exists check).
+_rs_is_appended_after_class() {
+    local f="$1" lastbrace total after tailhooks
+    lastbrace="$(grep -nE '^\}' "$f" 2>/dev/null | tail -1 | cut -d: -f1)"
+    [ -n "$lastbrace" ] || return 1
+    total="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+    after=$((total - lastbrace))
+    [ "$after" -gt 40 ] 2>/dev/null || return 1
+    tailhooks="$(tail -n "$after" "$f" 2>/dev/null | grep -cE '^[[:space:]]*(add_action|add_filter)[[:space:]]*\(')"
+    [ "$tailhooks" -gt 10 ] 2>/dev/null
+}
+
+# scan_user_hider_literal_id: PHP hard-coding a numeric user ID into any of
+# the 7 user-hiding hook shapes below. Two or more co-occurring in one file
+# is user-hider-literal-id HIGH; when that code also sits AFTER the file's
+# last top-level closing brace (see _rs_is_appended_after_class), it's the
+# stronger user-hider-appended-code HIGH instead. Generic appended hook code
+# with NO ID-hiding signal is the separate, weaker appended-hooks-after-class
+# MED. A plugin that excludes a ROLE rather than a literal numeric ID never
+# matches any of the 7 shapes, so it is not flagged.
+scan_user_hider_literal_id() {
+    info "Checking for hard-coded user-ID hiding code..."
+    # Bounded work (RATSWEEPR-009 hygiene): a single batch pre-filter for ANY
+    # of the 7 shapes' trigger hook names narrows PHPLIST (often thousands of
+    # files) down to a handful of candidates before the detailed per-shape
+    # checks run below - avoids forking ~15 greps for every single file.
+    local trigger='pre_user_query|pre_get_users|rest_user_query|wp_dropdown_users_args|wp_sitemaps_users_query_args|pre_get_posts|template_redirect|rest_pre_dispatch|xmlrpc_methods|admin_head-users\.php|views_users'
+    local candidates; candidates="$(rs_tmp user-hider-candidates)"
+    { xargs -0 grep -lE --null -e "$trigger" < "$PHPLIST" 2>/dev/null || true; } > "$candidates"
+
+    local f rel sig ids appended
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        sig=0; ids=""
+        if grep -qE 'pre_user_query' "$f" 2>/dev/null \
+           && grep -qE 'ID[[:space:]]*(<>|!=)[[:space:]]*(%d|[0-9]+)' "$f" 2>/dev/null; then
+            sig=$((sig+1)); ids="$ids $(grep -oE 'ID[[:space:]]*(<>|!=)[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+')"
+        fi
+        if grep -qE 'pre_get_users|rest_user_query|wp_dropdown_users_args|wp_sitemaps_users_query_args' "$f" 2>/dev/null \
+           && grep -qE 'exclude\]?\[?[[:space:]]*=[[:space:]]*[0-9]+' "$f" 2>/dev/null; then
+            sig=$((sig+1)); ids="$ids $(grep -oE 'exclude\]?\[?[[:space:]]*=[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+')"
+        fi
+        if grep -qE 'pre_get_posts' "$f" 2>/dev/null \
+           && grep -qE 'author__not_in\]?\[?[[:space:]]*=[[:space:]]*[0-9]+' "$f" 2>/dev/null; then
+            sig=$((sig+1)); ids="$ids $(grep -oE 'author__not_in\]?\[?[[:space:]]*=[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+')"
+        fi
+        if grep -qE 'template_redirect' "$f" 2>/dev/null && grep -qiE 'author.{0,80}404|404.{0,80}author' "$f" 2>/dev/null; then
+            sig=$((sig+1))
+        fi
+        if grep -qE 'rest_pre_dispatch' "$f" 2>/dev/null && grep -qE '/wp/v2/users/[0-9]+' "$f" 2>/dev/null; then
+            sig=$((sig+1)); ids="$ids $(grep -oE '/wp/v2/users/[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+')"
+        fi
+        if grep -qE 'xmlrpc_methods' "$f" 2>/dev/null && grep -qF 'wp.getUsers' "$f" 2>/dev/null; then
+            sig=$((sig+1))
+        fi
+        if grep -qF 'admin_head-users.php' "$f" 2>/dev/null \
+           && grep -qE 'display[[:space:]]*:[[:space:]]*none' "$f" 2>/dev/null \
+           && grep -qE '#user-[0-9]+' "$f" 2>/dev/null; then
+            sig=$((sig+1)); ids="$ids $(grep -oE '#user-[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+')"
+        fi
+        if grep -qE 'views_users' "$f" 2>/dev/null \
+           && grep -qE 'preg_replace|str_replace' "$f" 2>/dev/null \
+           && grep -qE '\([0-9]+\)' "$f" 2>/dev/null; then
+            sig=$((sig+1))
+        fi
+
+        if [ "$sig" -ge 2 ]; then
+            ids="$(printf '%s' "$ids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
+            appended=0; _rs_is_appended_after_class "$f" && appended=1
+            if [ "$appended" = "1" ]; then
+                report "HIGH" "user-hider-appended-code" "$rel" "hard-coded user-ID hiding code ($sig signal(s)${ids:+, ID(s): ${ids% }}) found appended AFTER the file's last top-level class/function definition - classic 'tack malicious code onto a legitimate plugin' persistence; verify and remove the appended block"
+            else
+                report "HIGH" "user-hider-literal-id" "$rel" "hard-coded user-ID hiding code ($sig signal(s) co-occurring${ids:+, ID(s): ${ids% }}) - review and remove"
+            fi
+        fi
+    done < "$candidates"
+
+    # appended-hooks-after-class (generic, no ID-hiding signal of its own):
+    # restricted to plugin/theme MAIN files - one per plugin/theme, not every
+    # vendor/helper file - via its own small batch pre-filter, so this never
+    # pays grep -n/wc -l/tail on thousands of unrelated files.
+    local mainfiles; mainfiles="$(rs_tmp user-hider-mainfiles)"
+    { xargs -0 grep -lE --null -e '^[[:space:]*/]*(Plugin|Theme) Name[[:space:]]*:' < "$PHPLIST" 2>/dev/null || true; } > "$mainfiles"
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -Fq $'\tuser-hider-appended-code\t'"$rel"$'\t' "$REPORT" 2>/dev/null && continue
+        if _rs_is_appended_after_class "$f"; then
+            report "MED" "appended-hooks-after-class" "$rel" "more than 40 lines of add_action/add_filter calls at file scope after the last class/function definition - generically-appended hook code, review"
+        fi
+    done < "$mainfiles"
+    ok "User-ID-hiding check done."
+}
+
+# scan_noop_heartbeat_cron: wp_schedule_single_event() guarded by
+# wp_next_scheduled() on init, whose registered callback has no apparent
+# body (MED; HIGH only when the same file already carries a user-hider
+# finding this run) - plus orphan-cron-hook, hooks in the cron option that
+# no installed plugin/theme file references by name (INFO, HIGH only when
+# the sole reference is inside a file this scan already flagged).
+scan_noop_heartbeat_cron() {
+    _rs_db_scan_allowed || return
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    info "Checking for no-op heartbeat cron scheduling and orphan cron hooks..."
+
+    local f rel hook
+    while IFS= read -r -d '' f; do
+        rel="${f#"$WPROOT"/}"
+        grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+        grep -qE "add_action[[:space:]]*\([[:space:]]*['\"]init['\"]" "$f" 2>/dev/null || continue
+        grep -qE 'wp_next_scheduled[[:space:]]*\(' "$f" 2>/dev/null || continue
+        grep -qE 'wp_schedule_single_event[[:space:]]*\(' "$f" 2>/dev/null || continue
+        hook="$(grep -oE "wp_next_scheduled[[:space:]]*\([[:space:]]*['\"][a-zA-Z0-9_\\\\]+['\"]" "$f" 2>/dev/null | head -1 | sed -E "s/.*['\"]([a-zA-Z0-9_\\\\]+)['\"].*/\1/")"
+        [ -n "$hook" ] || continue
+        grep -qE "add_action[[:space:]]*\([[:space:]]*['\"]${hook}['\"]" "$f" 2>/dev/null || continue
+        local sev="MED" extra=""
+        if grep -Fq $'\tuser-hider-literal-id\t'"$rel" "$REPORT" 2>/dev/null \
+           || grep -Fq $'\tuser-hider-appended-code\t'"$rel" "$REPORT" 2>/dev/null; then
+            sev="HIGH"; extra=" - corroborated by a hard-coded user-ID hiding finding in the SAME file"
+        fi
+        report "$sev" "noop-heartbeat-cron" "$rel" "schedules '$hook' as a single event guarded by wp_next_scheduled() on init, with an apparently empty/no-op callback - heartbeat-style persistence pattern$extra"
+    done < "$PHPLIST"
+
+    local cronval; cronval="$(db_query "SELECT option_value FROM ${P}options WHERE option_name='cron';")"
+    [ -n "$cronval" ] || { ok "No-op/orphan-cron check done."; return; }
+    local hooks; hooks="$(rs_tmp noop-cron-hooks)"
+    printf '%s' "$cronval" | grep -oE '"[A-Za-z0-9_]+";a:[0-9]+:\{s:32:' | sed -E 's/^"//; s/";.*$//' | sort -u > "$hooks"
+    while IFS= read -r hook; do
+        [ -n "$hook" ] || continue
+        case "$hook" in wp_*|action_scheduler_*|woocommerce_*|wc_*) continue;; esac
+        if { xargs -0 grep -lF -- "$hook" < "$PHPLIST" 2>/dev/null || true; } | grep -q .; then
+            continue
+        fi
+        local sev="INFO" extra=""
+        if grep -Fq $'\tnoop-heartbeat-cron\t' "$REPORT" 2>/dev/null && grep -Fq "$hook" "$REPORT" 2>/dev/null; then
+            sev="HIGH"; extra=" - this hook name is otherwise referenced ONLY inside a file already flagged by this scan"
+        fi
+        report "$sev" "orphan-cron-hook" "cron-hook:$hook" "hook '$hook' is scheduled in the cron option but no installed plugin/theme file references it by name$extra"
+    done < "$hooks"
+    ok "No-op/orphan-cron check done."
+}
+
+# scan_account_area (RATSWEEPR-009/R3, read-only): the real-world family kept
+# a restore copy OUTSIDE the web root, beside the WordPress install - a scan
+# limited to the web root can never see this. PARENT = the directory above
+# $WPROOT. Lists only: hidden dot-directories matching ^\.[0-9a-f]{6,12}$,
+# files with extension .lkg, and any file/directory whose name contains an
+# 8-hex suffix already confirmed by scan_suffix_family THIS run. Bounded
+# depth 3, never follows a symlink, never reads file content at all. A
+# deliberate preview/quarantine copy (suspected*/quarantine*/*.bak) is INFO,
+# never HIGH, and is excluded from the deeper walk (never rescanned) unless
+# --include-quarantine is given.
+scan_account_area() {
+    local parent
+    parent="$(cd "$WPROOT/.." 2>/dev/null && pwd -P)"
+    if [ -z "$parent" ] || [ ! -r "$parent" ]; then
+        report "WARN" "account-area" "-" "parent directory of the WordPress root is not readable - skipped"
+        return
+    fi
+    info "Checking the account area outside the web root for persistence copies..."
+
+    local qpaths; qpaths="$(rs_tmp account-area-qpaths)"
+    # Bounded to the same depth-3 limit as the persistence walk below - a
+    # preview/quarantine copy can legitimately sit under e.g. PARENT/private/
+    # (a common shared-hosting "account private area" layout), not only
+    # directly under PARENT itself.
+    find "$parent" -maxdepth 3 \( -type d -iname 'suspected*' -o -type d -iname 'quarantine*' -o -type f -iname '*.bak' \) -print 2>/dev/null > "$qpaths"
+    local qp rel
+    while IFS= read -r qp; do
+        [ -n "$qp" ] || continue
+        rel="${qp#"$parent"/}"
+        report "INFO" "persistence-outside-webroot" "$rel" "leftover copy of earlier cleanup (suspected*/quarantine*/*.bak) - contains known-bad files: remove when no longer needed"
+    done < "$qpaths"
+
+    local pruneexpr=("$RS_KIT_DIR" "$RS_REPORT_DIR" "$RS_CACHE" "${RS_QUARANTINE:-}" "$WPROOT")
+    if [ "${RS_INCLUDE_QUARANTINE:-0}" != "1" ]; then
+        while IFS= read -r qp; do
+            [ -n "$qp" ] && pruneexpr+=("$qp")
+        done < "$qpaths"
+    fi
+    local pruneargs=() pp
+    for pp in "${pruneexpr[@]}"; do
+        [ -n "$pp" ] || continue
+        [ "${#pruneargs[@]}" -gt 0 ] && pruneargs+=(-o)
+        pruneargs+=(-path "$pp")
+    done
+
+    local suffixes; suffixes="$(rs_tmp account-area-suffixes)"
+    awk -F'\t' '$2=="suffix-family"{print $4}' "$REPORT" 2>/dev/null \
+        | grep -oE 'family id: [0-9a-f]{8}' | grep -oE '[0-9a-f]{8}' | sort -u > "$suffixes"
+
+    local entries; entries="$(rs_tmp account-area-entries)"
+    find "$parent" -maxdepth 3 \( "${pruneargs[@]}" \) -prune -o \
+         \( -type d -name '.??????*' -o -type f -name '*.lkg' \
+            -o -type d -name '*-????????*' -o -type f -name '*-????????*' \) -print 2>/dev/null > "$entries"
+
+    local p base isdotdir issuffix sfx sz
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        [ -L "$p" ] && continue
+        base="$(basename -- "$p")"
+        rel="${p#"$parent"/}"
+
+        isdotdir=0
+        printf '%s' "$base" | grep -qE '^\.[0-9a-f]{6,12}$' && isdotdir=1
+        issuffix=0
+        case "$base" in *.lkg) issuffix=1 ;; esac
+        if [ -s "$suffixes" ]; then
+            while IFS= read -r sfx; do
+                [ -n "$sfx" ] || continue
+                case "$base" in *"$sfx"*) issuffix=1 ;; esac
+            done < "$suffixes"
+        fi
+        [ "$isdotdir" = "1" ] || [ "$issuffix" = "1" ] || continue
+
+        sz="?"
+        [ -f "$p" ] && sz="$(wc -c < "$p" 2>/dev/null | tr -d ' ')"
+        report "HIGH" "persistence-outside-webroot" "$rel" "path in the account area (outside the web root, under $parent) matches the persistence-family shape - size: $sz byte(s); a web-root-only scan can never see this - review and remove by hand"
+    done < "$entries"
+    ok "Account-area check done."
 }
 
 scan_hashdb() {
@@ -1452,6 +2458,32 @@ _rs_is_wordfence_prepend_legit() {
     return 0
 }
 
+# _rs_is_wordfence_waf_bootstrap_legit FILE (RATSWEEPR-009/R1): true only if
+# FILE is the webroot-level wordfence-waf.php bootstrap itself (not a value a
+# directive points AT - see _rs_is_wordfence_prepend_legit above for that) and
+# its content, once comments/whitespace are stripped, is nothing but the
+# standard shape: a file_exists() guard around a define() and an include_once
+# of the installed Wordfence plugin's own waf/bootstrap.php. No eval, no
+# superglobals, no network calls, nothing else - a field-seen variant that
+# ALSO contains eval(base64_decode(...)) stays HIGH because the dangerous-
+# token check below rejects it outright.
+_rs_is_wordfence_waf_bootstrap_legit() {
+    local f="$1" stripped
+    [ "$(basename -- "$f")" = "wordfence-waf.php" ] || return 1
+    [ -d "$WPROOT/wp-content/plugins/wordfence/waf" ] || return 1
+    local sz; sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
+    [ "$sz" -le 2048 ] 2>/dev/null || return 1
+    stripped="$(sed -E 's#//.*$##' "$f" 2>/dev/null | tr -d '[:space:]')"
+    case "$stripped" in
+        *eval\(*|*base64_decode\(*|*gzinflate\(*|*gzuncompress\(*|*system\(*|*exec\(*|*passthru\(*|*assert\(*|*curl_*|*'$_GET'*|*'$_POST'*|*'$_REQUEST'*|*'$_COOKIE'*|*'$_SERVER'*)
+            return 1 ;;
+    esac
+    printf '%s' "$stripped" | grep -qF 'file_exists(' || return 1
+    printf '%s' "$stripped" | grep -qE '(require|include)(_once)?[[:space:]]*\(?' || return 1
+    printf '%s' "$stripped" | grep -qF 'wp-content/plugins/wordfence/waf/bootstrap.php' || return 1
+    return 0
+}
+
 write_bundled_yara() {
     printf '// bundled-version: %s\n' "$RS_VERSION" > "$1"
     cat >> "$1" << 'RSYARA'
@@ -1470,7 +2502,14 @@ rule RS_eval_user_input {
         // retrieval(...), both of which contain "eval(" as a bare substring -
         // confirmed against a clean Gravity Forms copy, see VERIFY.md
         $a = /\b(eval|assert)\s*\(\s*(stripslashes\s*\()?\s*\$_(POST|GET|REQUEST|COOKIE)/ nocase
-        $b = /\b(eval|assert)\s*\(\s*\$[a-zA-Z_]+\s*\)/ nocase
+        // RATSWEEPR-009/R1: a bare eval($var)/assert($var) used to match
+        // unconditionally, which false-positived on a vendored template
+        // engine's eval() of its own rendered buffer (no user input anywhere
+        // near it). Now requires a request superglobal or php://input to
+        // appear INSIDE the same eval/assert call - either directly, or via
+        // an assignment nested in the same argument expression
+        // (eval($x = $_GET['a'])) - never just "eval of some variable."
+        $b = /\b(eval|assert)\s*\([^;]{0,200}(\$_(GET|POST|REQUEST|COOKIE)\b|php:\/\/input)/ nocase
     condition:
         any of them
 }
@@ -2772,6 +3811,45 @@ scan_vulnerable_plugins() {
 }
 
 
+# _rs_extract_hides_admin_ids FILE -> space-separated numeric user IDs
+# found near a pre_user_query/views_users-style hiding construct
+# (RATSWEEPR-009/R1) - best-effort text extraction (generic shapes: "ID <>
+# N", "exclude[] = N", "user_id == N"), not a PHP parser. Used only to make
+# the finding's own output more informative; detection itself never depends
+# on this succeeding.
+_rs_extract_hides_admin_ids() {
+    grep -oE "(\bID[[:space:]]*(<>|!=)[[:space:]]*%?d?[[:space:]]*,?[[:space:]]*[0-9]+|exclude\]?\[?[[:space:]]*=[[:space:]]*[0-9]+|user_id[[:space:]]*==?[[:space:]]*[0-9]+)" "$1" 2>/dev/null \
+        | grep -oE '[0-9]+' | sort -un | tr '\n' ' '
+}
+
+# scan_hides_admin_db_crossref (RATSWEEPR-009/R1): runs AFTER the DB scan, so
+# it can tell a leftover hard-coded ID (no matching row - a deleted rogue
+# admin's remnant) apart from a STILL-active hidden admin (a row exists) for
+# every ID scan_heuristics extracted from a hides_admin_users_* finding this
+# same run. Read-only; never deletes or modifies anything.
+scan_hides_admin_db_crossref() {
+    _rs_db_scan_allowed || return
+    [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
+    local P="${DBPREFIX:-wp_}"
+    db_query "SELECT 1" | grep -q 1 || return
+    local ids; ids="$(rs_tmp hides-admin-crossref-ids)"
+    awk -F'\t' '$2 ~ /^heuristic:hides_admin_users_/ {print $4}' "$REPORT" 2>/dev/null \
+        | grep -oE 'hard-coded user ID\(s\): [0-9 ]+' | grep -oE '[0-9]+' | sort -un > "$ids"
+    [ -s "$ids" ] || return
+    local id login
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        login="$(db_query "SELECT user_login FROM ${P}users WHERE ID=$id;" | head -1)"
+        if [ -n "$login" ]; then
+            report "HIGH" "hides-admin-user-active" "user:$id" \
+                "user ID $id is referenced by a hides_admin_users_* hiding hook AND has a row in ${P}users (login=$login) - likely an ACTIVE hidden admin; verify by hand before any action"
+        else
+            report "INFO" "hides-admin-user-leftover" "user:$id" \
+                "user ID $id is referenced by a hides_admin_users_* hiding hook but has NO row in ${P}users - likely a leftover reference to a previously deleted rogue admin"
+        fi
+    done < "$ids"
+}
+
 scan_heuristics() {
     info "Running heuristic pattern scan (grep, from patterns.conf)..."
     local name rex n=0
@@ -2806,7 +3884,30 @@ scan_heuristics() {
                     # either of those is true.
                     report "INFO" "heuristic:$name" "$rel" "matched '$name' inside */vendor/* but only adds+removes the hook with no \$wpdb/wp_users write - benign (vendored library's own transient hook use)"
                 else
-                    report "$basesev" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW"
+                    # RATSWEEPR-009/R1: keep hides_admin_users_* HIGH - DO NOT
+                    # weaken this heuristic further (a field false-positive
+                    # triage turned out to be a real hidden-admin backdoor).
+                    # Make the output more useful instead: the hard-coded
+                    # user ID(s), the line(s) the hook is registered at, and
+                    # - when the file is checksum-verified - a note that this
+                    # code can't be official, so the hit is only possible in
+                    # unverifiable (premium/custom) code. Whether a hidden ID
+                    # still has a row in wp_users is cross-referenced after
+                    # the DB scan by scan_hides_admin_db_crossref().
+                    local extra=""
+                    case "$name" in
+                        hides_admin_users_prequery|hides_admin_users_views)
+                            local hideids hidelines
+                            hideids="$(_rs_extract_hides_admin_ids "$f")"
+                            hidelines="$(grep -nE 'pre_user_query|views_users' "$f" 2>/dev/null | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')"
+                            if grep -Fxq "$rel" "$VERIFIED" 2>/dev/null; then
+                                extra="$extra; file is checksum-verified against wordpress.org - this code cannot be official, so the hit is only possible in unverifiable (premium/custom) code"
+                            fi
+                            [ -n "$hideids" ] && extra="$extra; hard-coded user ID(s): ${hideids% }"
+                            [ -n "$hidelines" ] && extra="$extra (hook registered at line(s) $hidelines)"
+                            ;;
+                    esac
+                    report "$basesev" "heuristic:$name" "$rel" "matched pattern '$name' - REVIEW$extra"
                 fi
             done < "$hitlist"
         elif [ "$type" = "FNAME" ]; then
@@ -3630,24 +4731,39 @@ scan_admin_session_review() {
     _rs_db_scan_allowed || return
     [ -n "$WPCLI" ] || [ "$HAVE_MYSQL" = "1" ] || return
     local P="${DBPREFIX:-wp_}"
+    # RATSWEEPR-009/R4: every admin scan_users triaged (not just ones already
+    # correlated to an exploit artifact), plus the user_id behind any
+    # orphaned-admin-usermeta hit this run.
     local ids
-    ids="$(awk -F'\t' '$2 ~ /^compromise:(ADMIN_CREATED_BY_EXPLOIT|SUSPICIOUS_ADMIN|EVIDENCE_USER)$/ && $3 ~ /^user:/ {sub(/user:/,"",$3); print $3}' "$REPORT" 2>/dev/null | sort -un)"
+    ids="$(
+        { awk -F'\t' '($2 ~ /^compromise:(ADMIN_CREATED_BY_EXPLOIT|SUSPICIOUS_ADMIN|EVIDENCE_USER)$/ || $2=="db-admin-user" || $2=="user-suspicious" || $2=="user-known") && $3 ~ /^user:/ {sub(/^user:/,"",$3); print $3}' "$REPORT" 2>/dev/null
+          awk -F'\t' '$2=="user-orphan-admin-meta"{print $4}' "$REPORT" 2>/dev/null | grep -oE 'user_id=[0-9]+' | grep -oE '[0-9]+'
+        } | sort -un
+    )"
     [ -n "$ids" ] || return
 
+    if [ "${RS_SHAREABLE:-0}" != "1" ]; then
+        report "INFO" "report-contains-ips" "-" "this report contains IP addresses and user agents from session_tokens - do not share it outside your own team; re-run with --shareable to omit them"
+    fi
+
+    local now_epoch; now_epoch="$(date +%s 2>/dev/null || echo 0)"
     local id raw
     local sess_ips; sess_ips="$(rs_tmp admin-session-ips)"
+    local sess_uas; sess_uas="$(rs_tmp admin-session-uas)"
     for id in $ids; do
         raw="$(db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$id AND meta_key='session_tokens';")"
         [ -n "$raw" ] || continue
         local ip n=0
         printf '%s' "$raw" | grep -oE 's:2:"ip";s:[0-9]+:"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' > "$sess_ips"
+        printf '%s' "$raw" | grep -oE 's:2:"ua";s:[0-9]+:"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' > "$sess_uas"
+        local netlist; netlist="$(rs_tmp admin-session-nets)"; : > "$netlist"
         while IFS= read -r ip; do
             n=$((n+1))
             # best-effort: session_tokens serializes each entry as
             # ip/ua/login/expiration in that fixed order, so the Nth ip pairs
-            # with the Nth login timestamp - not a strict guarantee, but WP
+            # with the Nth login timestamp/UA - not a strict guarantee, but WP
             # always emits them in this order.
-            local epoch login
+            local epoch login ua ipshown uashown
             # match from "login" (not the s:5: length-prefix before it) so the
             # extracted digits are ONLY the timestamp - s:5: would otherwise
             # contribute a spurious leading "5" as a second grep -oE match.
@@ -3656,9 +4772,33 @@ scan_admin_session_review() {
             if [ -n "$epoch" ]; then
                 login="$(date -r "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'epoch:%s' "$epoch")"
             fi
-            report "MED" "admin-session" "user:$id" "session IP=$ip login=$login - review and destroy if not recognized"
+            ua="$(sed -n "${n}p" "$sess_uas")"
+
+            ipshown="$ip"; uashown="$ua"
+            [ "${RS_SHAREABLE:-0}" = "1" ] && ipshown="[redacted]" && uashown="[redacted]"
+            report "MED" "admin-session" "user:$id" "session IP=$ipshown UA=$uashown login=$login - review and destroy if not recognized"
+
+            # crawler UA holding an administrator session - crawlers do not log in.
+            local token
+            while IFS='|' read -r type token; do
+                [ "$type" = "CRAWLERUA" ] || continue
+                case "$ua" in *"$token"*)
+                    report "HIGH" "admin-session-crawler-ua" "user:$id" "session login=$login has a crawler/bot User-Agent ('$token') on an ADMINISTRATOR session - crawlers do not hold logged-in admin sessions; treat as forged/replayed, destroy and rotate salts"
+                    ;;
+                esac
+            done < "$PATTERNS_FILE"
+
+            if [ -n "$epoch" ] && [ "$now_epoch" -gt 0 ] 2>/dev/null \
+               && [ $((now_epoch - epoch)) -le 604800 ] 2>/dev/null; then
+                printf '%s\n' "$(printf '%s' "$ip" | cut -d. -f1,2)" >> "$netlist"
+            fi
         done < "$sess_ips"
         [ "$n" -gt 0 ] && notice "Admin user:$id has $n session(s) listed above - recommend destroying all sessions and rotating salts/passwords."
+
+        local netcount; netcount="$(sort -u "$netlist" 2>/dev/null | grep -cE '^[0-9]+\.[0-9]+$')"
+        if [ "$netcount" -gt 3 ] 2>/dev/null; then
+            report "MED" "admin-session-many-ips" "user:$id" "sessions from $netcount distinct /16 networks within the last 7 days - review for credential sharing/compromise"
+        fi
     done
 }
 
@@ -3786,19 +4926,32 @@ scan_compromise_indicators() {
     done < "$pocmarker"
 
     # 4b) ORPHANED admin usermeta: capability/user_level rows whose user no longer
-    #     exists = a created-then-deleted privileged account (deleted-account ghost).
+    #     exists = a created-then-deleted privileged account (deleted-account
+    #     ghost). RATSWEEPR-009/R4: promoted from INFO to HIGH user-orphan-
+    #     admin-meta (every row this query returns already has an admin-level
+    #     capability, by the WHERE clause itself) - prints the nickname when
+    #     one survives, a registration-time proxy (the last_update meta, if
+    #     it's an epoch), and copy-paste (NOT run) inspect/delete SQL.
     local orphanmeta; orphanmeta="$(rs_tmp compromise-orphaned-usermeta)"
     db_query "SELECT m.umeta_id, m.user_id, m.meta_key FROM ${P}usermeta m LEFT JOIN ${P}users u ON u.ID=m.user_id WHERE u.ID IS NULL AND (m.meta_key='${P}capabilities' OR m.meta_key='${P}user_level') AND (m.meta_value LIKE '%administrator%' OR m.meta_value='10') LIMIT 100;" > "$orphanmeta"
     while IFS=$'\t' read -r umid uid mkey; do
         [ -n "$umid" ] || continue
-        report "INFO" "compromise:ORPHANED_USERMETA" "usermeta:$umid" \
-            "orphaned admin meta (user_id=$uid key=$mkey) - a privileged account was created then deleted"
+        local onick olast oregproxy
+        onick="$(db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$uid AND meta_key='nickname' LIMIT 1;" | head -1)"
+        olast="$(db_query "SELECT meta_value FROM ${P}usermeta WHERE user_id=$uid AND meta_key='last_update' LIMIT 1;" | head -1)"
+        oregproxy=""
+        if printf '%s' "$olast" | grep -qE '^[0-9]{9,}$'; then
+            oregproxy="$(date -r "$olast" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$olast" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'epoch:%s' "$olast")"
+        fi
+        report "HIGH" "user-orphan-admin-meta" "usermeta:$umid" \
+            "orphaned admin meta (user_id=$uid key=$mkey${onick:+ nickname=$onick}${oregproxy:+ last_update(proxy)=$oregproxy}) - a privileged account was created then DELETED, leaving its usermeta behind; read-only inspect: SELECT * FROM ${P}usermeta WHERE user_id=$uid; -- delete the orphaned rows (NOT run by the scanner): DELETE FROM ${P}usermeta WHERE user_id=$uid;"
         evidence=$((evidence+1))
     done < "$orphanmeta"
 
-    # 4c) Suspicious admin logins/emails (wpenginebot-style impersonation, bot names).
+    # 4c) Suspicious admin logins/emails - generic hosting/infra-bot name
+    # impersonation (RATSWEEPR-009/R6: no hosting-brand token hard-coded here).
     local suspadmin; suspadmin="$(rs_tmp compromise-suspicious-admin)"
-    db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' WHERE m.meta_value LIKE '%administrator%' AND (u.user_login REGEXP '(bot|hidden|admin[0-9]|wpengine|hacker|shell)' OR u.user_email REGEXP '(wpenginebot|hidden|[0-9a-f]{12}@)') LIMIT 50;" > "$suspadmin"
+    db_query "SELECT u.ID, u.user_login, u.user_email, u.user_registered FROM ${P}users u JOIN ${P}usermeta m ON m.user_id=u.ID AND m.meta_key='${P}capabilities' WHERE m.meta_value LIKE '%administrator%' AND (u.user_login REGEXP '(bot|hidden|admin[0-9]|hacker|shell)' OR u.user_email REGEXP '(hidden|[0-9a-f]{12}@)') LIMIT 50;" > "$suspadmin"
     while IFS=$'\t' read -r id login email reg; do
         [ -n "$id" ] || continue
         report "INFO" "compromise:SUSPICIOUS_ADMIN" "user:$id" \
@@ -3807,19 +4960,58 @@ scan_compromise_indicators() {
     done < "$suspadmin"
 
     # 5) PHP files written to the webroot during the exploit window (dropped shells
-    #    the attacker forgot to timestomp). Uses mtime, best-effort.
+    #    the attacker forgot to timestomp). Uses mtime, best-effort. GNU `date -d`
+    #    first, BSD/macOS `date -j -f` fallback (same chain as _rs_days_between) -
+    #    without the fallback this whole check silently never ran on macOS.
     local since_epoch
-    since_epoch="$(date -d "$EXPLOIT_WINDOW_START" +%s 2>/dev/null || echo 0)"
-    if [ "$since_epoch" -gt 0 ]; then
+    since_epoch="$(date -d "$EXPLOIT_WINDOW_START" +%s 2>/dev/null)"
+    [ -n "$since_epoch" ] || since_epoch="$(date -j -f '%Y-%m-%d' "$EXPLOIT_WINDOW_START" +%s 2>/dev/null)"
+    [ -n "$since_epoch" ] || since_epoch=0
+    if [ "$since_epoch" -gt 0 ] 2>/dev/null; then
         local filesinwindow; filesinwindow="$(rs_tmp compromise-files-in-window)"
         find "$WPROOT/wp-content/uploads" "$WPROOT/wp-content/mu-plugins" -type f \
              \( -name '*.php' -o -name '*.phtml' \) -newermt "$EXPLOIT_WINDOW_START" -print0 2>/dev/null \
             | head -c 100000 > "$filesinwindow"
+        # RATSWEEPR-009/R1: don't list files that (a) passed checksum/trust-path
+        # verification (merged into $VERIFIED), or (b) are already an
+        # INFO-classified guard from above (data-only PHP, 404/empty stub,
+        # Wordfence bootstrap...) - collapse what's left into one line PER
+        # DIRECTORY with a count and the newest mtime, so a host-managed tree
+        # full of legitimate recent writes doesn't flood the report with
+        # one line per file. The summary's INFO count reflects the collapsed
+        # total, since only the collapsed lines are ever report()ed.
+        local infoitems; infoitems="$(rs_tmp compromise-fiw-infoitems)"
+        awk -F'\t' '$1=="INFO"{print $3}' "$REPORT" 2>/dev/null | sort -u > "$infoitems"
+        local fiwkept; fiwkept="$(rs_tmp compromise-fiw-kept)"
+        : > "$fiwkept"
+        local f rel mtime
         while IFS= read -r -d '' f; do
-            report "INFO" "compromise:FILE_IN_WINDOW" "${f#"$WPROOT"/}" \
-                "PHP file modified on/after $EXPLOIT_WINDOW_START - possible dropped payload"
-            evidence=$((evidence+1))
+            rel="${f#"$WPROOT"/}"
+            grep -Fxq "$rel" "$VERIFIED" 2>/dev/null && continue
+            grep -Fxq "$rel" "$infoitems" 2>/dev/null && continue
+            mtime="$(stat -c %Y "$f" 2>/dev/null)"
+            [ -n "$mtime" ] || mtime="$(stat -f %m "$f" 2>/dev/null)"
+            [ -n "$mtime" ] || continue
+            printf '%s\t%s\n' "$rel" "$mtime" >> "$fiwkept"
         done < "$filesinwindow"
+        if [ -s "$fiwkept" ]; then
+            local collapsed; collapsed="$(rs_tmp compromise-fiw-collapsed)"
+            awk -F'\t' '
+                { d=$1; i=length(d); while (i>0 && substr(d,i,1)!="/") i--; dir=(i>0?substr(d,1,i-1):".");
+                  cnt[dir]++; if ($2+0 > newest[dir]) newest[dir]=$2+0 }
+                END { for (dir in cnt) printf "%s\t%d\t%d\n", dir, cnt[dir], newest[dir] }
+            ' "$fiwkept" | sort > "$collapsed"
+            local dir cnt newest newestfmt
+            while IFS=$'\t' read -r dir cnt newest; do
+                [ -n "$dir" ] || continue
+                newestfmt="$(date -r "$newest" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+                [ -n "$newestfmt" ] || newestfmt="$(date -d "@$newest" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+                [ -n "$newestfmt" ] || newestfmt="epoch:$newest"
+                report "INFO" "compromise:FILE_IN_WINDOW" "$dir" \
+                    "$cnt PHP file(s) in this directory modified on/after $EXPLOIT_WINDOW_START (newest: $newestfmt) - possible dropped payload(s), review"
+                evidence=$((evidence+1))
+            done < "$collapsed"
+        fi
     fi
 
     if [ "$evidence" -gt 0 ]; then
@@ -4217,6 +5409,7 @@ run_scan() {
     : > "$VERIFIED"
     load_signatures
     build_php_filelist
+    rs_timed _rs_trustpath_prescan
     rs_timed scan_core_vulns
     rs_timed scan_core_checksums
     rs_timed scan_core_orphans
@@ -4228,6 +5421,7 @@ run_scan() {
     rs_timed scan_vulnerable_plugins
     rs_timed scan_outdated_plugins
     rs_timed scan_mu_plugins
+    rs_timed scan_managed_mu_plugin_structural
     rs_timed scan_xss_hidden_admin_paths
     rs_timed scan_rankmath_fake_core_file
     rs_timed scan_plugin_analytics_module
@@ -4238,6 +5432,10 @@ run_scan() {
     rs_timed scan_wpconfig_content
     rs_timed scan_uploads_php
     rs_timed scan_asset_tampering
+    rs_timed scan_payload_containers
+    rs_timed scan_disguised_data_php
+    rs_timed scan_suffix_family
+    rs_timed scan_hidden_dir_php
     rs_timed scan_exploit_upload_paths
     rs_timed scan_hashdb
     rs_timed scan_yara
@@ -4250,6 +5448,9 @@ run_scan() {
     rs_timed scan_secret_gated_exec_grep_fallback
     rs_timed scan_compress_zlib_grep_fallback
     rs_timed scan_heuristics
+    rs_timed scan_class_iocs
+    rs_timed scan_external_script_enqueue
+    rs_timed scan_user_hider_literal_id
     rs_timed scan_nulled
     rs_timed scan_external_requests
     rs_timed scan_htaccess
@@ -4260,11 +5461,17 @@ run_scan() {
     rs_timed scan_rankmath_readonly_indicators
     rs_timed scan_malicious_options
     rs_timed scan_stale_login_tokens
+    rs_timed scan_db_option_iocs
+    rs_timed scan_network_iocs
+    rs_timed scan_noop_heartbeat_cron
+    rs_timed scan_fake_plugin_header
     rs_timed scan_admin_exploit_correlation
     rs_timed scan_cve_artifacts
     rs_timed scan_compromise_indicators
     rs_timed scan_users
     rs_timed scan_admin_session_review
+    rs_timed scan_hides_admin_db_crossref
+    rs_timed scan_account_area
     rm -f "$PHPLIST"
     finalize_report
     wordfence_write_attribution
@@ -4281,6 +5488,23 @@ run_scan() {
     say "  MED  findings : $med   (suspicious - review before acting)"
     say "  INFO findings : $infoc   (context for your review)"
     say ""
+    # RATSWEEPR-009/R1: every R1 false-positive downgrade tags its INFO line's
+    # detail with "[suppressed:<rule>]" - never silent. One summary line here,
+    # broken down by rule, before the verdict; every suppressed item is still
+    # in the report body as an auditable INFO row with that same tag.
+    local suppfile; suppfile="$(rs_tmp suppression-summary)"
+    awk -F'\t' '
+        $1=="INFO" && match($4, /\[suppressed:[^]]+\]/) {
+            r = substr($4, RSTART+12, RLENGTH-13); cnt[r]++; tot++
+        }
+        END { for (r in cnt) printf "%s\t%d\n", r, cnt[r]; print "TOTAL\t" tot+0 }
+    ' "$REPORT" > "$suppfile"
+    local supptotal; supptotal="$(awk -F'\t' '$1=="TOTAL"{print $2}' "$suppfile")"
+    if [ -n "$supptotal" ] && [ "$supptotal" -gt 0 ] 2>/dev/null; then
+        local suppby; suppby="$(awk -F'\t' '$1!="TOTAL"{printf "%s%s=%s", (n++?", ":""), $1, $2}' "$suppfile")"
+        say "  Suppressed as known-benign: $supptotal (by rule: $suppby)"
+        say ""
+    fi
     # A check that could not run (empty/missing input, a failed producer -
     # see check_incomplete) must never be read as "nothing to report": its
     # files are UNVERIFIED, not clean. This line, and the VERDICT override
@@ -4305,15 +5529,13 @@ run_scan() {
     # under NEEDS REVIEW rather than a false "you're compromised." Zero HIGH
     # of either kind is NO KNOWN MALWARE FOUND, never "CLEAN" - this scanner
     # cannot prove absence. SCAN INCOMPLETE still wins over all of this.
-    local confirm_high; confirm_high="$(awk -F'\t' '
-        $1=="HIGH" {
-            c=$2
-            if (c=="db-loader-injection" || c=="plugin-analytics-module" || c=="fake-core-file" ||
-                c=="wp-config-injection" || c=="known-malware" || c=="php-in-uploads" ||
-                c=="compromise:ADMIN_CREATED_BY_EXPLOIT" || c=="compromise:CHANGESET_POC_PATTERN" ||
-                c=="user-hidden" || c=="user-suspicious" ||
-                c ~ /^yara:/ || c ~ /^heuristic:/) print
-        }' "$REPORT" | wc -l | tr -d ' ')"
+    # RATSWEEPR-009: the confirm-category list is kept in ONE shell variable,
+    # used by both awk passes below (verdict count + "Verify these" filter),
+    # so the two can never drift apart again.
+    local confirm_cats; confirm_cats='^(db-loader-injection|plugin-analytics-module|fake-core-file|wp-config-injection|known-malware|php-in-uploads|compromise:ADMIN_CREATED_BY_EXPLOIT|compromise:CHANGESET_POC_PATTERN|user-hidden|user-suspicious|hides-admin-user-active|user-orphan-admin-meta|admin-session-crawler-ua|payload-container|php-disguised-as-data|suffix-family|hidden-dir-php|class-ioc|db-option-ioc|ioc-host|user-hider-literal-id|user-hider-appended-code|persistence-outside-webroot|fake-plugin-header|external-script-enqueue|yara:.*|heuristic:.*)$'
+    local confirm_high; confirm_high="$(awk -F'\t' -v CATS="$confirm_cats" '
+        $1=="HIGH" && $2 ~ CATS { print }
+    ' "$REPORT" | wc -l | tr -d ' ')"
     local verdict_str=""
     if [ "$incomplete" -gt 0 ]; then
         warn "VERDICT: INCOMPLETE  ($incomplete check(s) did not run - re-run once fixed; not a clean bill of health)"
@@ -4344,15 +5566,10 @@ run_scan() {
     if [ "$verdict_str" = "SUSPICIOUS" ]; then
         say ""
         say "  --- Verify these (integrity/oddity HIGH findings, not a confirmed compromise) ---"
-        awk -F'\t' '
+        awk -F'\t' -v CATS="$confirm_cats" '
             $1=="HIGH" {
-                c=$2
-                if (c=="db-loader-injection" || c=="plugin-analytics-module" || c=="fake-core-file" ||
-                    c=="wp-config-injection" || c=="known-malware" || c=="php-in-uploads" ||
-                    c=="compromise:ADMIN_CREATED_BY_EXPLOIT" || c=="compromise:CHANGESET_POC_PATTERN" ||
-                    c=="user-hidden" || c=="user-suspicious" ||
-                    c ~ /^yara:/ || c ~ /^heuristic:/) next
-                printf "  %-28s %s\n", c, $3
+                if ($2 ~ CATS) next
+                printf "  %-28s %s\n", $2, $3
             }' "$REPORT"
     fi
     say ""
@@ -4749,6 +5966,12 @@ Usage (run from the WordPress root, where wp-config.php lives):
   ratsweepr.sh scan --report-dir DIR     write report to DIR (default: $HOME/ratsweepr-reports)
   ratsweepr.sh scan --known-user LOGIN_OR_EMAIL   suppress user triage for this account (repeatable)
   ratsweepr.sh scan --known-domain DOMAIN         suppress user triage for this email domain (repeatable)
+  ratsweepr.sh scan --include-quarantine   also walk into suspected*/quarantine*/*.bak
+                                 copies found outside the web root (scan_account_area)
+  ratsweepr.sh scan --shareable            redact IPs/User-Agents from admin-session findings
+  ratsweepr.sh scan --include-quarantine   also walk into suspected*/quarantine*/*.bak
+                                 copies found outside the web root (scan_account_area)
+  ratsweepr.sh scan --shareable            redact IPs/User-Agents from admin-session findings
   ratsweepr.sh scan-all [ROOT_GLOB...]   scan every WordPress root found (default: common
                                  shared-hosting layouts under $HOME); one report per
                                  site plus a summary table in $HOME/ratsweepr-reports/.
@@ -4760,6 +5983,11 @@ Usage (run from the WordPress root, where wp-config.php lives):
   ratsweepr.sh share-report     make a redacted copy of the latest report (opt-in, nothing is uploaded)
   ratsweepr.sh wp-config-review review flagged wp-config.php lines (read-only, secrets masked)
   ratsweepr.sh print-hash FILE  SHA-256 of FILE, for allowlist.conf
+  ratsweepr.sh trust-path REL [--yes]   trust a file/directory (relative to the
+                                 WordPress root) by content hash; future scans
+                                 skip it silently as long as the hash matches,
+                                 and loudly flag it (trusted-path-modified HIGH)
+                                 the moment it doesn't
   ratsweepr.sh help-report      report looks empty, or you don't understand it?
   ratsweepr.sh help             this help
 EOU
@@ -4792,6 +6020,8 @@ SINCE_DATE=""
 RS_REPORT_DIR_OVERRIDE=""
 KNOWN_USERS=()
 KNOWN_DOMAINS=()
+RS_INCLUDE_QUARANTINE=0
+RS_SHAREABLE="${RS_SHAREABLE:-0}"
 cmd="${1:-menu}"; shift || true
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -4799,6 +6029,8 @@ while [ $# -gt 0 ]; do
         --report-dir) RS_REPORT_DIR_OVERRIDE="${2:-}"; shift 2;;
         --known-user) KNOWN_USERS+=("${2:-}"); shift 2;;
         --known-domain) KNOWN_DOMAINS+=("${2:-}"); shift 2;;
+        --include-quarantine) RS_INCLUDE_QUARANTINE=1; shift;;
+        --shareable) RS_SHAREABLE=1; shift;;
         *) set -- "$1" "${@:2}"; break;;
     esac
 done
@@ -4806,7 +6038,7 @@ done
 # Commands that don't need a WordPress root are handled before preflight, so
 # help and unknown/removed commands work from any directory.
 case "$cmd" in
-    menu|scan|scan-all|update-sigs|share-report|wp-config-review|print-hash|help-report) ;;
+    menu|scan|scan-all|update-sigs|share-report|wp-config-review|print-hash|trust-path|help-report) ;;
     help|-h|--help)  usage; exit 0;;
     *)               usage; die "Unknown command: $cmd (RatSweepr Free is read-only; cleanup commands are not included)";;
 esac
@@ -4829,5 +6061,11 @@ case "$cmd" in
     wp-config-review) wp_config_review;;
     print-hash)      [ $# -ge 1 ] || die "Usage: $0 print-hash <file>"
                      print_hash "$1";;
+    trust-path)      [ $# -ge 1 ] || die "Usage: $0 trust-path <relative-path> [--yes]"
+                     RS_TRUSTPATH_YES=0; tp_rel=""
+                     for tp_a in "$@"; do
+                         case "$tp_a" in --yes) RS_TRUSTPATH_YES=1;; *) tp_rel="$tp_a";; esac
+                     done
+                     trust_path "$tp_rel";;
     help-report)     help_report;;
 esac
