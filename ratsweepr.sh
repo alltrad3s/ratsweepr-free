@@ -41,7 +41,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.27-free"
+RS_VERSION="2.9.28-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -508,6 +508,17 @@ ALLOWHOST|woocommerce.com
 # --- trusted vendor paths (ALLOWPATH|prefix|reinstall-url-or-dash) ---
 # No entries ship by default (RATSWEEPR-009/R6) - use `ratsweepr.sh trust-path`
 # to trust a host-managed path by content hash instead of hard-coding one here.
+#
+# --- known-good wordfence-waf.php bootstrap templates (RATSWEEPR-010/R2),
+#     for real-world variants (e.g. the bootstrap path assigned to a
+#     variable first) that don't fit the single generic inline-literal-path
+#     shape _rs_is_wordfence_waf_bootstrap_legit() checks structurally.
+#     WAFBOOTSTRAP|<template> - <template> is the file's content with EVERY
+#     comment and ALL whitespace stripped (exactly what print-hash-style
+#     normalization produces), matched by EXACT STRING EQUALITY, never a
+#     substring/blocklist check. Ships empty - only add a template after
+#     you've verified it by hand against a real, unmodified Wordfence
+#     install; a single added/removed/reordered character never matches.
 #
 # --- large-file exceptions for scan_payload_containers/scan_disguised_data_php
 #     (CONTAINEREXCLUDE|path-glob, relative to the WordPress root) - ships
@@ -1606,11 +1617,15 @@ _rs_is_uploads_php_stub() {
     printf '%s' "$stripped" | grep -qE '^<\?php(exit(\(\))?;?|die(\(\))?;?|return;?)?$'
 }
 
-# _rs_is_404_stub FILE (RATSWEEPR-009/R1): true only if, with comments/whitespace
-# stripped, FILE is nothing but one or more header(...) calls whose argument is
-# an HTTP 404 status line, plus an optional bare exit/die - e.g. the common
-# "silence this directory, return a real 404 to anyone poking at it" guard.
-# Any other statement (an echo, a require, an assignment) fails this check.
+# _rs_is_404_stub FILE (RATSWEEPR-010/R3, hardened): true only if, with
+# comments/whitespace stripped, FILE is nothing but one or more header(...)
+# calls - each argument REQUIRED to START with "HTTP/" or "Status:" (not
+# merely contain "404" anywhere) and also contain "404" - plus an optional
+# bare exit/die. The 009 version matched "404" anywhere in the quoted
+# string, so header("Location: https://example.invalid/404") (a redirect,
+# not a status response) was wrongly cleared; requiring the recognized
+# status-line prefix closes that. Any other statement (an echo, a require,
+# an assignment) still fails this check.
 _rs_is_404_stub() {
     local f="$1" sz stripped
     sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
@@ -1619,41 +1634,212 @@ _rs_is_404_stub() {
         | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
         | tr -d '[:space:]')"
     printf '%s' "$stripped" \
-        | grep -qE '^<\?php(header\(["'"'"'][^"'"'"']*404[^"'"'"']*["'"'"']\);?)+(exit(\(\))?;?|die(\(\))?;?)?$'
+        | grep -qE '^<\?php(header\(["'"'"'](HTTP/[^"'"'"']*404[^"'"'"']*|Status:[^"'"'"']*404[^"'"'"']*)["'"'"']\);?)+(exit(\(\))?;?|die(\(\))?;?)?$'
 }
 
-# _rs_is_data_only_php FILE (RATSWEEPR-009/R1): true only if, once comments and
-# whitespace are stripped, FILE's token stream contains NOTHING but <?php, a
-# standard ABSPATH guard, and bare scalar/array variable assignments (string,
-# number, array-literal) - no function/method call of any kind, no
-# include/require, no backticks, no superglobal use, no eval/assert/
-# base64_decode/gzinflate/str_rot13/create_function anywhere. This is exactly
-# the shape of a PDF library's font-definition file ($type=...; $name=...;
-# $cw=[...];) - conservative text/regex, not a real PHP parser (php may be
-# absent on a shared host), so ANY construct outside that short allowlist
-# falls through to the HIGH below rather than risk clearing real code.
+# _rs_dataonly_has_long_line FILE -> 0 (true) if any line is over 20KB
+# (RATSWEEPR-010/R1 - bounds the tokenizer's own work and rejects an
+# obfuscated single-line payload outright, belt-and-suspenders).
+_rs_dataonly_has_long_line() {
+    awk 'BEGIN{bad=0} { if (length($0) > 20480) bad=1 } END { exit (bad?0:1) }' "$1" 2>/dev/null
+}
+
+# _rs_dataonly_trailing_after_close FILE -> 0 (true) if the file's LAST "?>"
+# (if any) is followed by any non-whitespace content (RATSWEEPR-010/R1).
+_rs_dataonly_trailing_after_close() {
+    awk '
+        { buf = buf $0 "\n" }
+        END {
+            pos = 1; lastpos = 0
+            while (1) {
+                p = index(substr(buf, pos), "?>")
+                if (p == 0) break
+                lastpos = pos + p - 1
+                pos = lastpos + 2
+            }
+            if (lastpos == 0) exit 1
+            rest = substr(buf, lastpos + 2)
+            gsub(/[ \t\r\n]/, "", rest)
+            exit (length(rest) > 0 ? 0 : 1)
+        }
+    ' "$1" 2>/dev/null
+}
+
+# _rs_dataonly_tokenize reads a comment-stripped, <?php/?>-stripped PHP
+# statement body on stdin and exits 0 only if it is NOTHING but zero or more
+# "$var = VALUE;" / "$var[KEY] = VALUE;" statements, where VALUE is itself
+# recursively: a quoted string with no unescaped quote and no backslash
+# escape other than \' \" \\ (RATSWEEPR-010: a \x.. or octal escape, used to
+# smuggle arbitrary bytes, fails), a number, true/false/null, or a nested
+# array(...)/[...] literal of such values (with optional "key =>").
+# ALLOWLIST tokenizer (RATSWEEPR-010/R1, replacing the 009 version's
+# "[^;]*" blocklist gap): at every position, the scanner tries each allowed
+# token type in turn; if NONE match, the file is rejected. This is what
+# makes a bare identifier followed by "(" (any function/method call), a "."
+# outside a string (concatenation), a "$" inside a value, "::"/"->", or a
+# backtick fail CLOSED automatically - none of them is a token this
+# tokenizer knows how to consume, so there is no way to "forget" one as a
+# blocklist entry. Lookahead windows are bounded (not "rest of string") so
+# cost stays O(n) even on a large $cw=array(...) with thousands of entries.
+_rs_dataonly_tokenize() {
+    awk '
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
+    function skipws(s, pos,   c) {
+        while (pos <= length(s)) {
+            c = substr(s, pos, 1)
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") pos++
+            else break
+        }
+        return pos
+    }
+    function consume_string(s, pos,   q, i, c, nx, len) {
+        len = length(s)
+        q = substr(s, pos, 1)
+        if (q != SQ && q != DQ) return -1
+        i = pos + 1
+        while (i <= len) {
+            c = substr(s, i, 1)
+            if (c == "\\") {
+                nx = substr(s, i + 1, 1)
+                if (nx == q || nx == "\\") { i += 2; continue }
+                return -1
+            }
+            if (c == q) return i + 1
+            i++
+        }
+        return -1
+    }
+    function consume_number(s, pos,   win) {
+        win = substr(s, pos, 40)
+        if (match(win, /^-?[0-9]+(\.[0-9]+)?/)) return pos + RLENGTH
+        return -1
+    }
+    function consume_boolnull(s, pos,   win, kwlen, nextc) {
+        win = substr(s, pos, 10)
+        if (match(win, /^(true|false|null)/)) {
+            kwlen = RLENGTH
+            nextc = substr(s, pos + kwlen, 1)
+            if (nextc == "" || nextc !~ /[A-Za-z0-9_]/) return pos + kwlen
+        }
+        return -1
+    }
+    function consume_array_items(s, pos, closer) {
+        pos = skipws(s, pos)
+        if (pos > length(s)) return -1
+        if (substr(s, pos, 1) == closer) return pos + 1
+        while (1) {
+            pos = consume_value(s, pos)
+            if (pos < 0) return -1
+            pos = skipws(s, pos)
+            if (substr(s, pos, 2) == "=>") {
+                pos = pos + 2
+                pos = consume_value(s, pos)
+                if (pos < 0) return -1
+                pos = skipws(s, pos)
+            }
+            if (substr(s, pos, 1) == closer) return pos + 1
+            if (substr(s, pos, 1) == ",") {
+                pos = skipws(s, pos + 1)
+                if (substr(s, pos, 1) == closer) return pos + 1
+                continue
+            }
+            return -1
+        }
+    }
+    function consume_value(s, pos,   c, win, r) {
+        pos = skipws(s, pos)
+        if (pos > length(s)) return -1
+        c = substr(s, pos, 1)
+        if (c == SQ || c == DQ) return consume_string(s, pos)
+        r = consume_number(s, pos); if (r > 0) return r
+        r = consume_boolnull(s, pos); if (r > 0) return r
+        win = substr(s, pos, 40)
+        if (match(win, /^[Aa][Rr][Rr][Aa][Yy][ \t\r\n]*\(/)) return consume_array_items(s, pos + RLENGTH, ")")
+        if (c == "[") return consume_array_items(s, pos + 1, "]")
+        return -1
+    }
+    { buf = buf $0 "\n" }
+    END {
+        s = buf; len = length(s); ok = 1
+        pos = skipws(s, 1)
+        while (pos <= len) {
+            win = substr(s, pos, 100)
+            if (!match(win, /^\$[A-Za-z_][A-Za-z0-9_]*/)) { ok = 0; break }
+            pos = skipws(s, pos + RLENGTH)
+            if (substr(s, pos, 1) == "[") {
+                pos = skipws(s, pos + 1)
+                c = substr(s, pos, 1)
+                pos = (c == SQ || c == DQ) ? consume_string(s, pos) : consume_number(s, pos)
+                if (pos < 0) { ok = 0; break }
+                pos = skipws(s, pos)
+                if (substr(s, pos, 1) != "]") { ok = 0; break }
+                pos = skipws(s, pos + 1)
+            }
+            if (substr(s, pos, 1) != "=" || substr(s, pos, 2) == "==" || substr(s, pos, 2) == "=>") { ok = 0; break }
+            pos = skipws(s, pos + 1)
+            pos = consume_value(s, pos)
+            if (pos < 0) { ok = 0; break }
+            pos = skipws(s, pos)
+            if (substr(s, pos, 1) != ";") { ok = 0; break }
+            pos = skipws(s, pos + 1)
+        }
+        exit (ok ? 0 : 1)
+    }
+    '
+}
+
+# _rs_is_data_only_php FILE (RATSWEEPR-010/R1, rewritten from the 009
+# version): true only if, once comments and whitespace are stripped, FILE's
+# token stream contains NOTHING but <?php, a standard ABSPATH guard, and
+# bare scalar/array variable assignments - verified by the strict ALLOWLIST
+# tokenizer above, not by a "disqualifier list" blocklist (the 009 version's
+# assignment-stripping regex used "[^;]*" inside array/string literals,
+# which let a call, a concatenated call, or a superglobal hide inside
+# brackets/quotes as long as no literal ";" appeared - confirmed exploitable
+# with $a=[shell_exec("id")]; and $a="a".passthru("id")."b"; and
+# $a=[call_user_func("assert",$_FILES["f"]["name"])]; - see RATSWEEPR-010).
+# This is exactly the shape of a PDF library's font-definition file
+# ($type=...; $name=...; $cw=[...];) - conservative text/regex, not a real
+# PHP parser (php may be absent on a shared host), so ANY construct outside
+# the tokenizer's allowlist falls through to the HIGH below.
 _rs_is_data_only_php() {
-    local f="$1" sz body
+    local f="$1" sz
     sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
-    [ "$sz" -le 2000000 ] 2>/dev/null || return 1
+    # Real font-definition files are a few KB to a few tens of KB; capped
+    # well below the old 2MB ceiling both to bound the tokenizer's work and
+    # because nothing genuinely data-only is ever this large.
+    [ "$sz" -le 300000 ] 2>/dev/null || return 1
     grep -qE '<\?php|<\?=' "$f" 2>/dev/null || return 1
-    # Hard disqualifiers anywhere in the file - a single match of any of these
-    # means it is NOT data-only, full stop.
-    grep -qiE '\$_(GET|POST|REQUEST|COOKIE|SERVER)\b|`|\beval[[:space:]]*\(|\bassert[[:space:]]*\(|base64_decode|gzinflate|gzuncompress|str_rot13|create_function|\b(include|require)(_once)?\b' "$f" 2>/dev/null \
+
+    # RATSWEEPR-010/R1: more than one <?php, a ?> followed by non-whitespace
+    # content, or any line over 20KB is never data-only - checked on the RAW
+    # file, not the comment-stripped body (a literal "<?php" inside a
+    # comment would otherwise be stripped away and never counted here, but
+    # we deliberately count BEFORE stripping to stay conservative). Deliberately
+    # NOT "grep -c" (which counts matching LINES, not occurrences - two
+    # "<?php" on the SAME line would under-count as 1 and slip through) -
+    # "grep -o | wc -l" counts actual occurrences regardless of line layout.
+    local opens; opens="$(grep -oi '<?php' "$f" 2>/dev/null | wc -l | tr -d ' ')"
+    [ -n "$opens" ] && [ "$opens" -le 1 ] 2>/dev/null || return 1
+    _rs_dataonly_trailing_after_close "$f" && return 1
+    _rs_dataonly_has_long_line "$f" && return 1
+
+    # Hard disqualifiers anywhere in the RAW file - belt-and-suspenders on
+    # top of the allowlist tokenizer below, extended per RATSWEEPR-010 to
+    # cover the dangerous functions the 009 list omitted.
+    grep -qiE '\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES|ENV)\b|\$GLOBALS\b|`|\b(eval|assert|exec|system|shell_exec|passthru|popen|proc_open|call_user_func|call_user_func_array|file_put_contents|fwrite|fopen|file_get_contents|curl_init|curl_exec|unserialize|create_function)[[:space:]]*\(|base64_decode|gzinflate|gzuncompress|str_rot13|preg_replace[[:space:]]*\([[:space:]]*["'"'"'][^"'"'"']*/[a-zA-Z]*e[a-zA-Z]*["'"'"']|\b(include|require)(_once)?\b' "$f" 2>/dev/null \
         && return 1
+
+    local body scrubbed
     body="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
         | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g')"
-    # Strip the one allowed function-looking construct (the ABSPATH guard)
-    # before checking for "any function call at all", then strip every bare
-    # scalar/array assignment statement; whatever is left must be nothing but
-    # <?php/?>, whitespace and semicolons - any leftover token is a call,
-    # control structure, or something else this check doesn't recognize.
-    local scrubbed
     scrubbed="$(printf '%s' "$body" \
-        | sed -E "s/if[[:space:]]*\([[:space:]]*!?[[:space:]]*defined[[:space:]]*\([[:space:]]*['\"]ABSPATH['\"][[:space:]]*\)[[:space:]]*\)[[:space:]]*(\{[[:space:]]*)?exit;?(\})?/;/g" \
-        | sed -E "s/\\\$[A-Za-z_][A-Za-z0-9_]*(\[[^]=]*\])?[[:space:]]*=[[:space:]]*(array[[:space:]]*\([^;]*\)|\[[^;]*\]|['\"][^;]*['\"]|-?[0-9.]+|true|false|null)[[:space:]]*;//Ig" \
-        | tr -d '[:space:];' | sed -E 's/<\?php//; s/\?>$//')"
-    [ -z "$scrubbed" ]
+        | sed -E "s/if[[:space:]]*\([[:space:]]*!?[[:space:]]*defined[[:space:]]*\([[:space:]]*['\"]ABSPATH['\"][[:space:]]*\)[[:space:]]*\)[[:space:]]*(\{[[:space:]]*)?exit;?(\})?//g" \
+        | sed -E 's/<\?php//; s/<\?=//; s/\?>[[:space:]]*$//')"
+
+    local bodyfile; bodyfile="$(rs_tmp dataonly-body)"
+    printf '%s' "$scrubbed" > "$bodyfile"
+    _rs_dataonly_tokenize < "$bodyfile"
 }
 
 scan_uploads_php() {
@@ -2458,30 +2644,52 @@ _rs_is_wordfence_prepend_legit() {
     return 0
 }
 
-# _rs_is_wordfence_waf_bootstrap_legit FILE (RATSWEEPR-009/R1): true only if
-# FILE is the webroot-level wordfence-waf.php bootstrap itself (not a value a
-# directive points AT - see _rs_is_wordfence_prepend_legit above for that) and
-# its content, once comments/whitespace are stripped, is nothing but the
-# standard shape: a file_exists() guard around a define() and an include_once
-# of the installed Wordfence plugin's own waf/bootstrap.php. No eval, no
-# superglobals, no network calls, nothing else - a field-seen variant that
-# ALSO contains eval(base64_decode(...)) stays HIGH because the dangerous-
-# token check below rejects it outright.
+# _rs_is_wordfence_waf_bootstrap_legit FILE (RATSWEEPR-010/R2): an
+# EXACT-SHAPE match, not a blocklist (the 009 version cleared anything that
+# merely AVOIDED a list of bad words - a file with an extra statement the
+# blocklist didn't name would have slipped through as "legit"). After
+# stripping comments/whitespace, the content must either:
+#   (a) exactly equal one of the known normalized bootstrap templates in
+#       patterns.conf (WAFBOOTSTRAP|<template>) - for real-world variants
+#       (e.g. the path assigned to a variable first) that don't fit (b), or
+#   (b) consist of NOTHING but <?php, one single
+#       if(file_exists(PATH)){define('WFWAF_LOG_PATH',...);
+#       (include_once|require_once)PATH;} block where PATH is the identical
+#       text in both places (compared as plain strings, not a regex
+#       backreference - portable on BSD/GNU grep/sed alike), then an
+#       optional ?>. ANY statement before/after/inside beyond that exact
+#       shape - an appended shell_exec(...), a second include of another
+#       path, anything - fails closed to HIGH.
 _rs_is_wordfence_waf_bootstrap_legit() {
-    local f="$1" stripped
+    local f="$1" norm
     [ "$(basename -- "$f")" = "wordfence-waf.php" ] || return 1
     [ -d "$WPROOT/wp-content/plugins/wordfence/waf" ] || return 1
     local sz; sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
     [ "$sz" -le 2048 ] 2>/dev/null || return 1
-    stripped="$(sed -E 's#//.*$##' "$f" 2>/dev/null | tr -d '[:space:]')"
-    case "$stripped" in
-        *eval\(*|*base64_decode\(*|*gzinflate\(*|*gzuncompress\(*|*system\(*|*exec\(*|*passthru\(*|*assert\(*|*curl_*|*'$_GET'*|*'$_POST'*|*'$_REQUEST'*|*'$_COOKIE'*|*'$_SERVER'*)
-            return 1 ;;
+
+    norm="$(sed -E 's#//.*$##' "$f" 2>/dev/null \
+        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
+        | tr -d '[:space:]')"
+    norm="${norm%\?>}"
+
+    local type tmpl
+    while IFS='|' read -r type tmpl; do
+        [ "$type" = "WAFBOOTSTRAP" ] || continue
+        [ -n "$norm" ] && [ "$norm" = "$tmpl" ] && return 0
+    done < "$PATTERNS_FILE"
+
+    case "$norm" in
+        '<?php'*) : ;;
+        *) return 1 ;;
     esac
-    printf '%s' "$stripped" | grep -qF 'file_exists(' || return 1
-    printf '%s' "$stripped" | grep -qE '(require|include)(_once)?[[:space:]]*\(?' || return 1
-    printf '%s' "$stripped" | grep -qF 'wp-content/plugins/wordfence/waf/bootstrap.php' || return 1
-    return 0
+    printf '%s' "$norm" | grep -qE \
+        '^<\?phpif\(file_exists\([^()]*wp-content/plugins/wordfence/waf/bootstrap\.php[^()]*\)\)\{define\([^;]*WFWAF_LOG_PATH[^;]*\);(include_once|require_once)[^;]*;\}$' \
+        || return 1
+
+    local path1 path2
+    path1="$(printf '%s' "$norm" | sed -E 's/^<\?phpif\(file_exists\((.*)\)\)\{define\([^;]*WFWAF_LOG_PATH[^;]*\);(include_once|require_once)[^;]*;\}$/\1/')"
+    path2="$(printf '%s' "$norm" | sed -E 's/^<\?phpif\(file_exists\([^()]*\)\)\{define\([^;]*WFWAF_LOG_PATH[^;]*\);(include_once|require_once)([^;]*);\}$/\2/')"
+    [ -n "$path1" ] && [ "$path1" = "$path2" ]
 }
 
 write_bundled_yara() {
@@ -5954,6 +6162,131 @@ EOF2
     exit "$worst"
 }
 
+# selftest (RATSWEEPR-010/R4): runs every "suppression" classifier
+# (_rs_is_data_only_php, _rs_is_404_stub, _rs_is_uploads_php_stub,
+# _rs_is_wordfence_waf_bootstrap_legit) against a corpus of synthetic
+# fixtures that MUST stay HIGH - the regression guard for the whole class
+# of bug this ticket fixes: a suppression rule that's secretly a blocklist
+# (checks for a list of bad words) instead of an allowlist (checks that
+# EVERY construct present is one it explicitly recognizes as safe) clears
+# anything that merely avoids the listed words. `make test` runs this and
+# fails the build the moment any fixture is wrongly downgraded. Needs no
+# WordPress root - writes its own scratch fixtures under $RS_CACHE via
+# rs_tmp and cleans up after itself like everything else in this script.
+selftest() {
+    load_signatures
+    local dir; dir="$(rs_tmp selftest-dir)"
+    rm -f "$dir"; mkdir -p "$dir" || die "selftest: could not create a scratch directory"
+    local fail=0 f
+
+    info "Running suppression-classifier regression corpus..."
+
+    # --- _rs_is_data_only_php: must stay HIGH (RATSWEEPR-010 repro cases
+    #     plus the extra malformation guards: double <?php, trailing content
+    #     after ?>, a statement after the ABSPATH exit guard) ---
+    printf '%s\n' '<?php $a = [ shell_exec("id") ];' > "$dir/d1.php"
+    printf '%s\n' '<?php $a = "a" . passthru("id") . "b";' > "$dir/d2.php"
+    printf '%s\n' '<?php $a = [ call_user_func("assert", $_FILES["f"]["name"]) ];' > "$dir/d3.php"
+    printf '%s\n' '<?php $a = 1; <?php $b = 2;' > "$dir/d4.php"
+    printf '%s\n' '<?php $a = 1; ?> trailing <?php' > "$dir/d5.php"
+    printf '%s\n' "<?php if(!defined('ABSPATH')) exit; \$a = shell_exec(\$_GET['x']);" > "$dir/d6.php"
+    for f in d1 d2 d3 d4 d5 d6; do
+        if _rs_is_data_only_php "$dir/$f.php"; then
+            bad "selftest FAIL: _rs_is_data_only_php wrongly cleared $f.php"; fail=1
+        else
+            ok "selftest: _rs_is_data_only_php correctly rejected $f.php"
+        fi
+    done
+    # ...and must still PASS a real font-definition file, so this corpus
+    # also catches a future change that neuters the classifier entirely.
+    {
+        printf '%s\n' '<?php'
+        printf '%s\n' "\$type='TrueTypeUnicode';"
+        printf '%s\n' "\$name='Helvetica';"
+        printf '%s\n' "\$desc=array('Ascent'=>952,'Descent'=>-213,'FontBBox'=>'[-166 -225 1000 931]','StemV'=>70);"
+        printf '%s\n' "\$cw=array(0=>600,32=>278,33=>278,34=>355,35=>556,36=>556,37=>889,38=>667,39=>191,40=>333);"
+        printf '%s\n' "if(!defined('ABSPATH')) exit;"
+    } > "$dir/good_font.php"
+    if _rs_is_data_only_php "$dir/good_font.php"; then
+        ok "selftest: _rs_is_data_only_php correctly cleared good_font.php"
+    else
+        bad "selftest FAIL: _rs_is_data_only_php wrongly rejected a legitimate font-definition file"; fail=1
+    fi
+
+    # --- _rs_is_404_stub: a Location: redirect must stay HIGH, a real 404 must clear ---
+    printf '%s\n' '<?php header("Location: https://example.invalid/404");' > "$dir/stub_bad.php"
+    if _rs_is_404_stub "$dir/stub_bad.php"; then
+        bad "selftest FAIL: _rs_is_404_stub wrongly cleared a Location-redirect header"; fail=1
+    else
+        ok "selftest: _rs_is_404_stub correctly rejected stub_bad.php"
+    fi
+    printf '%s\n' '<?php header("HTTP/1.0 404 Not Found"); exit;' > "$dir/stub_good.php"
+    if _rs_is_404_stub "$dir/stub_good.php"; then
+        ok "selftest: _rs_is_404_stub correctly cleared stub_good.php"
+    else
+        bad "selftest FAIL: _rs_is_404_stub wrongly rejected a genuine 404 stub"; fail=1
+    fi
+
+    # --- _rs_is_uploads_php_stub: an appended call after the bare exit must stay HIGH ---
+    printf '%s\n' "<?php exit; shell_exec('id');" > "$dir/emptystub_bad.php"
+    if _rs_is_uploads_php_stub "$dir/emptystub_bad.php"; then
+        bad "selftest FAIL: _rs_is_uploads_php_stub wrongly cleared a stub with an appended call"; fail=1
+    else
+        ok "selftest: _rs_is_uploads_php_stub correctly rejected emptystub_bad.php"
+    fi
+
+    # --- _rs_is_wordfence_waf_bootstrap_legit: appended statement / a second
+    #     include must stay HIGH; the genuine shape must still clear ---
+    # The basename MUST be exactly wordfence-waf.php (that's part of what
+    # the function checks) - one shared wp-content/plugins/wordfence/waf
+    # tree, reused sequentially for each variant under that fixed name.
+    local wfdir; wfdir="$dir/wf"
+    mkdir -p "$wfdir/wp-content/plugins/wordfence/waf"
+    local WPROOT="$wfdir"
+    local wftarget="$wfdir/wordfence-waf.php"
+
+    {
+        printf '%s\n' '<?php'
+        printf '%s\n' "if (file_exists(__DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php')) {"
+        printf '%s\n' "    define('WFWAF_LOG_PATH', __DIR__ . '/wp-content/wflogs/');"
+        printf '%s\n' "    include_once __DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php';"
+        printf '%s\n' "}"
+    } > "$wftarget"
+    if _rs_is_wordfence_waf_bootstrap_legit "$wftarget"; then
+        ok "selftest: _rs_is_wordfence_waf_bootstrap_legit correctly cleared the genuine bootstrap shape"
+    else
+        bad "selftest FAIL: _rs_is_wordfence_waf_bootstrap_legit wrongly rejected the genuine bootstrap shape"; fail=1
+    fi
+
+    printf '%s\n' "shell_exec('x');" >> "$wftarget"
+    if _rs_is_wordfence_waf_bootstrap_legit "$wftarget"; then
+        bad "selftest FAIL: _rs_is_wordfence_waf_bootstrap_legit wrongly cleared the bootstrap + an appended statement"; fail=1
+    else
+        ok "selftest: _rs_is_wordfence_waf_bootstrap_legit correctly rejected the bootstrap + an appended statement"
+    fi
+
+    {
+        printf '%s\n' '<?php'
+        printf '%s\n' "if (file_exists(__DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php')) {"
+        printf '%s\n' "    define('WFWAF_LOG_PATH', __DIR__ . '/wp-content/wflogs/');"
+        printf '%s\n' "    include_once __DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php';"
+        printf '%s\n' "    include_once __DIR__ . '/wp-content/other-path.php';"
+        printf '%s\n' "}"
+    } > "$wftarget"
+    if _rs_is_wordfence_waf_bootstrap_legit "$wftarget"; then
+        bad "selftest FAIL: _rs_is_wordfence_waf_bootstrap_legit wrongly cleared a second include of another path"; fail=1
+    else
+        ok "selftest: _rs_is_wordfence_waf_bootstrap_legit correctly rejected a second include of another path"
+    fi
+
+    rm -rf "$dir"
+    if [ "$fail" = "1" ]; then
+        bad "selftest: FAILED - one or more suppression classifiers wrongly downgraded a must-stay-HIGH fixture"
+        return 1
+    fi
+    ok "selftest: all suppression-classifier regression fixtures behaved correctly"
+}
+
 # ================================ MENU / CLI ==================================
 
 usage() {
@@ -5966,9 +6299,6 @@ Usage (run from the WordPress root, where wp-config.php lives):
   ratsweepr.sh scan --report-dir DIR     write report to DIR (default: $HOME/ratsweepr-reports)
   ratsweepr.sh scan --known-user LOGIN_OR_EMAIL   suppress user triage for this account (repeatable)
   ratsweepr.sh scan --known-domain DOMAIN         suppress user triage for this email domain (repeatable)
-  ratsweepr.sh scan --include-quarantine   also walk into suspected*/quarantine*/*.bak
-                                 copies found outside the web root (scan_account_area)
-  ratsweepr.sh scan --shareable            redact IPs/User-Agents from admin-session findings
   ratsweepr.sh scan --include-quarantine   also walk into suspected*/quarantine*/*.bak
                                  copies found outside the web root (scan_account_area)
   ratsweepr.sh scan --shareable            redact IPs/User-Agents from admin-session findings
@@ -5988,6 +6318,9 @@ Usage (run from the WordPress root, where wp-config.php lives):
                                  skip it silently as long as the hash matches,
                                  and loudly flag it (trusted-path-modified HIGH)
                                  the moment it doesn't
+  ratsweepr.sh selftest         regression-test the suppression classifiers
+                                 against a corpus of must-stay-HIGH fixtures;
+                                 no WordPress root needed
   ratsweepr.sh help-report      report looks empty, or you don't understand it?
   ratsweepr.sh help             this help
 EOU
@@ -6038,7 +6371,7 @@ done
 # Commands that don't need a WordPress root are handled before preflight, so
 # help and unknown/removed commands work from any directory.
 case "$cmd" in
-    menu|scan|scan-all|update-sigs|share-report|wp-config-review|print-hash|trust-path|help-report) ;;
+    menu|scan|scan-all|update-sigs|share-report|wp-config-review|print-hash|trust-path|selftest|help-report) ;;
     help|-h|--help)  usage; exit 0;;
     *)               usage; die "Unknown command: $cmd (RatSweepr Free is read-only; cleanup commands are not included)";;
 esac
@@ -6047,7 +6380,7 @@ preflight
 # scan-all (RATSWEEPR-008/R3) discovers and chdir's into its own roots - every
 # other command still needs to be run from inside a single WordPress root.
 case "$cmd" in
-    scan-all) : ;;
+    scan-all|selftest) : ;;
     *) require_wp_root ;;
 esac
 setup_report_paths
@@ -6067,5 +6400,6 @@ case "$cmd" in
                          case "$tp_a" in --yes) RS_TRUSTPATH_YES=1;; *) tp_rel="$tp_a";; esac
                      done
                      trust_path "$tp_rel";;
+    selftest)        selftest || die "selftest failed";;
     help-report)     help_report;;
 esac

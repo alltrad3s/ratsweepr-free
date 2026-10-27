@@ -8,6 +8,7 @@ VERSION ?= $(shell grep '^RS_VERSION=' ratsweepr.sh | cut -d'"' -f2)
 
 ## test: syntax check, yara sync check, and rule-compile check if yara-x is present
 test: lint check-nofd yara-sync
+	./ratsweepr.sh selftest
 	@command -v yr >/dev/null 2>&1 && yr scan ratsweepr.yar /dev/null >/dev/null 2>&1 \
 		&& echo "yara rules compile OK" \
 		|| echo "yara engine not present - skipping rule-compile check"
