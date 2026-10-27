@@ -41,7 +41,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.29-free"
+RS_VERSION="2.9.30-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -1615,8 +1615,19 @@ EOF
 # runs, closes that for every classifier that calls this gate first - no
 # comment-aware logic downstream can be fooled by a payload this gate never
 # lets through in the first place.
+# RATSWEEPR-012/R1: input is piped through "tr '\r' '\n'" first - PHP ends a
+# line comment at a bare "\r" exactly like "\n", but a file with ONLY bare-CR
+# line endings has no "\n" at all, so awk's default (newline-delimited)
+# record read sees the WHOLE FILE as one record. That doesn't change this
+# function's own tag-counting (it scans the concatenated buffer by raw
+# character position regardless of record boundaries), but normalizing here
+# anyway keeps this gate's view of the bytes identical to every other
+# RATSWEEPR-012-fixed function that DOES depend on "\n" (the long-line check
+# and the tokenizer's comment handling) - one consistent, CR-normalized view
+# of the file across all of them. A CRLF file normalizes to one harmless
+# blank line per real line.
 _rs_raw_phptag_shape_ok() {
-    awk '
+    tr '\r' '\n' < "$1" 2>/dev/null | awk '
     { buf = buf $0 "\n" }
     END {
         s = buf; len = length(s)
@@ -1650,7 +1661,7 @@ _rs_raw_phptag_shape_ok() {
         }
         exit 0
     }
-    ' "$1" 2>/dev/null
+    ' 2>/dev/null
 }
 
 # _rs_is_uploads_php_stub FILE -> 0 only if, with comments and whitespace
@@ -1699,8 +1710,15 @@ _rs_is_404_stub() {
 # _rs_dataonly_has_long_line FILE -> 0 (true) if any line is over 20KB
 # (RATSWEEPR-010/R1 - bounds the tokenizer's own work and rejects an
 # obfuscated single-line payload outright, belt-and-suspenders).
+# RATSWEEPR-012/R1: normalized through "tr '\r' '\n'" first - without it, a
+# bare-CR (no real "\n" at all) file is ONE awk record regardless of its
+# true line structure, so this check's per-"line" length measurement no
+# longer means what it says; normalizing makes awk's record boundaries match
+# PHP's own line/comment-ending semantics (which treat a bare "\r" as a line
+# end exactly like "\n").
 _rs_dataonly_has_long_line() {
-    awk 'BEGIN{bad=0} { if (length($0) > 20480) bad=1 } END { exit (bad?0:1) }' "$1" 2>/dev/null
+    tr '\r' '\n' < "$1" 2>/dev/null \
+        | awk 'BEGIN{bad=0} { if (length($0) > 20480) bad=1 } END { exit (bad?0:1) }' 2>/dev/null
 }
 
 # _rs_dataonly_tokenize reads a <?php/?>-stripped PHP statement body on
@@ -1722,7 +1740,17 @@ _rs_dataonly_has_long_line() {
 # blocklist entry. Lookahead windows are bounded (not "rest of string") so
 # cost stays O(n) even on a large $cw=array(...) with thousands of entries.
 _rs_dataonly_tokenize() {
-    awk '
+    # RATSWEEPR-012/R1: stdin is normalized through "tr '\r' '\n'" before
+    # awk ever sees it. PHP ends a "//"/"#" comment at a bare "\r" exactly
+    # like "\n", but the comment-consumption logic below only ever searched
+    # for "\n" - a file using bare-CR line endings has no "\n" at all, so
+    # awk's default newline-delimited record read saw the WHOLE FILE as one
+    # record and the comment consumed everything to the true end of file,
+    # hiding any real code after it. Normalizing here (not inside the awk
+    # program itself) keeps the fix in one place for every caller and
+    # matches the same normalization _rs_raw_phptag_shape_ok and
+    # _rs_dataonly_has_long_line apply to their own input.
+    tr '\r' '\n' | awk '
     BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); comment_bad = 0 }
     # RATSWEEPR-011/R1: comments are no longer stripped by sed before this
     # tokenizer runs (that threw away a real "<?= ...call()... ?>" hidden
@@ -6291,7 +6319,18 @@ selftest() {
     printf '%s\n' '<?php $a = "{$b()}";' > "$dir/d11.php"
     printf '%s\n' '<?php $a = "$b";' > "$dir/d12.php"
     printf '%s' '<?= 1 ?>' > "$dir/d13.php"
-    for f in d1 d2 d3 d4 d5 d6 d7 d8 d9 d10 d11 d12 d13; do
+    # --- RATSWEEPR-012/R1: bare-CR (and mixed CRLF/bare-CR) line endings -
+    #     PHP ends a "//"/"#" comment at a bare "\r" exactly like "\n", but
+    #     a file with ONLY bare-CR line endings has no "\n" at all, so the
+    #     011 tokenizer's "\n"-bounded comment consumption (and awk's
+    #     default newline-delimited record read generally) saw the whole
+    #     file as one giant "comment" and never saw the real code after it.
+    local CR LF; CR="$(printf '\r')"; LF="$(printf '\n')"
+    printf '%s' "<?php${CR}\$a = 1; // ${CR}placeholder_call();${CR}" > "$dir/d14.php"
+    printf '%s' "<?php${CR}\$a = 1; # ${CR}placeholder_call();${CR}" > "$dir/d15.php"
+    printf '%s' "<?php${CR}\$a = 1; /* ${CR}placeholder_call();${CR} */" > "$dir/d16.php"
+    printf '%s' "<?php${CR}${LF}\$a = 1; // ${CR}placeholder_call();${CR}${LF}" > "$dir/d17.php"
+    for f in d1 d2 d3 d4 d5 d6 d7 d8 d9 d10 d11 d12 d13 d14 d15 d16 d17; do
         if _rs_is_data_only_php "$dir/$f.php"; then
             bad "selftest FAIL: _rs_is_data_only_php wrongly cleared $f.php"; fail=1
         else
@@ -6326,6 +6365,27 @@ selftest() {
         ok "selftest: _rs_is_data_only_php correctly cleared good_font_commented.php"
     else
         bad "selftest FAIL: _rs_is_data_only_php wrongly rejected a legitimate commented font-definition file"; fail=1
+    fi
+    # RATSWEEPR-012/R1: a genuine font file using real CRLF line endings
+    # (common when authored/edited on Windows) must still clear - the
+    # "tr '\r' '\n'" normalization turns each CRLF into one harmless blank
+    # line, never into a rejection.
+    printf '%s' "<?php${CR}${LF}\$type='TrueTypeUnicode';${CR}${LF}\$name='Helvetica';${CR}${LF}\$cw=array(0=>600,32=>278);${CR}${LF}" > "$dir/good_font_crlf.php"
+    if _rs_is_data_only_php "$dir/good_font_crlf.php"; then
+        ok "selftest: _rs_is_data_only_php correctly cleared good_font_crlf.php"
+    else
+        bad "selftest FAIL: _rs_is_data_only_php wrongly rejected a legitimate CRLF font-definition file"; fail=1
+    fi
+    # RATSWEEPR-012/R2: a UTF-8 BOM (EF BB BF) before "<?php" is not
+    # data-only - the shape gate requires the open tag to be the FIRST
+    # content in the file, and the BOM's 3 bytes aren't whitespace, so this
+    # already failed closed with no code change; this fixture documents and
+    # locks in that the safe default (HIGH) is what actually happens.
+    printf '\xEF\xBB\xBF<?php $a=1;' > "$dir/bom.php"
+    if _rs_is_data_only_php "$dir/bom.php"; then
+        bad "selftest FAIL: _rs_is_data_only_php wrongly cleared a file with a UTF-8 BOM before <?php"; fail=1
+    else
+        ok "selftest: _rs_is_data_only_php correctly rejected bom.php (BOM before <?php)"
     fi
 
     # --- _rs_is_404_stub: a Location: redirect must stay HIGH, a real 404 must clear ---
