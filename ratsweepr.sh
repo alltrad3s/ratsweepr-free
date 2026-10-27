@@ -41,7 +41,7 @@
 set -u
 umask 077
 
-RS_VERSION="2.9.28-free"
+RS_VERSION="2.9.29-free"
 
 # ------------------------------ configuration --------------------------------
 # Everything lives under the invoking user's home; nothing touches system dirs.
@@ -1599,6 +1599,60 @@ EOF
     say "Then re-run: ratsweepr.sh scan"
 }
 
+# _rs_raw_phptag_shape_ok FILE (RATSWEEPR-011/R1): true only if, on the RAW
+# file bytes - BEFORE any comment stripping or other normalization by the
+# classifier calling this - there is EXACTLY ONE PHP open tag of any kind
+# (<?php, <?=, or a bare <?) anywhere in the file, it is the very first
+# non-whitespace content, and it is literally "<?php" (not "<?=" and not a
+# bare "<?"); and there is at most one "?>" close tag, which - if present -
+# must be the very last non-whitespace content in the file. PHP itself ends
+# a "//" or "#" line comment early at the FIRST "?>" it sees, long tag or
+# short - a suppression helper that stripped comments with sed BEFORE
+# judging the file (the 009/010 approach) threw away a real, executable
+# "<?= ...calls... ?>" hidden after a fake "// ?>"/"# ?>"/"/* ?>" along with
+# it, and never counted a bare "<?=" as an open tag at all. Checking tag
+# SHAPE on the untouched raw bytes, before any classifier-specific stripping
+# runs, closes that for every classifier that calls this gate first - no
+# comment-aware logic downstream can be fooled by a payload this gate never
+# lets through in the first place.
+_rs_raw_phptag_shape_ok() {
+    awk '
+    { buf = buf $0 "\n" }
+    END {
+        s = buf; len = length(s)
+        nopen = 0; firstopen = 0
+        for (i = 1; i <= len - 1; i++) {
+            if (substr(s, i, 2) == "<?") {
+                nopen++
+                if (firstopen == 0) firstopen = i
+            }
+        }
+        if (nopen != 1) exit 1
+        lead = substr(s, 1, firstopen - 1)
+        gsub(/[ \t\r\n]/, "", lead)
+        if (length(lead) > 0) exit 1
+        win = substr(s, firstopen, 10)
+        if (!match(win, /^<\?[Pp][Hh][Pp]([ \t\r\n]|$)/)) exit 1
+
+        nclose = 0; lastclose = 0; pos = 1
+        while (1) {
+            p = index(substr(s, pos), "?>")
+            if (p == 0) break
+            nclose++
+            lastclose = pos + p - 1
+            pos = lastclose + 2
+        }
+        if (nclose > 1) exit 1
+        if (nclose == 1) {
+            rest = substr(s, lastclose + 2)
+            gsub(/[ \t\r\n]/, "", rest)
+            if (length(rest) > 0) exit 1
+        }
+        exit 0
+    }
+    ' "$1" 2>/dev/null
+}
+
 # _rs_is_uploads_php_stub FILE -> 0 only if, with comments and whitespace
 # removed, FILE is nothing but "<?php" optionally followed by a bare
 # exit;/die;/return; (RATSWEEPR-007/R3) - judged purely on content, not on
@@ -1606,19 +1660,21 @@ EOF
 # like uploads/<plugin>/cache/index.php and uploads/<plugin>-db/index.php,
 # and a content-only rule covers any of those shapes without needing to
 # special-case a name (which an attacker could trivially also use).
+# RATSWEEPR-011/R1: no longer strips // or # comments before judging (that
+# let a real "<?= ...call()... ?>" hidden after a fake "// ?>" through) -
+# _rs_raw_phptag_shape_ok rejects any such file outright before the shape
+# regex below ever runs; a genuine stub this tiny never has comments.
 _rs_is_uploads_php_stub() {
     local f="$1" sz stripped
     sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
     [ "$sz" -le 220 ] 2>/dev/null || return 1
-    # strip // and # line comments, then /* */ block comments, then all whitespace
-    stripped="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
-        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
-        | tr -d '[:space:]')"
+    _rs_raw_phptag_shape_ok "$f" || return 1
+    stripped="$(tr -d '[:space:]' < "$f" 2>/dev/null)"
     printf '%s' "$stripped" | grep -qE '^<\?php(exit(\(\))?;?|die(\(\))?;?|return;?)?$'
 }
 
 # _rs_is_404_stub FILE (RATSWEEPR-010/R3, hardened): true only if, with
-# comments/whitespace stripped, FILE is nothing but one or more header(...)
+# whitespace stripped, FILE is nothing but one or more header(...)
 # calls - each argument REQUIRED to START with "HTTP/" or "Status:" (not
 # merely contain "404" anywhere) and also contain "404" - plus an optional
 # bare exit/die. The 009 version matched "404" anywhere in the quoted
@@ -1626,13 +1682,16 @@ _rs_is_uploads_php_stub() {
 # not a status response) was wrongly cleared; requiring the recognized
 # status-line prefix closes that. Any other statement (an echo, a require,
 # an assignment) still fails this check.
+# RATSWEEPR-011/R1: no longer strips // or # comments before judging -
+# _rs_raw_phptag_shape_ok rejects a file carrying a real "<?= ...call()...
+# ?>" hidden after a fake "// ?>" outright; a genuine stub this tiny never
+# has comments.
 _rs_is_404_stub() {
     local f="$1" sz stripped
     sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
     [ "$sz" -le 400 ] 2>/dev/null || return 1
-    stripped="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
-        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
-        | tr -d '[:space:]')"
+    _rs_raw_phptag_shape_ok "$f" || return 1
+    stripped="$(tr -d '[:space:]' < "$f" 2>/dev/null)"
     printf '%s' "$stripped" \
         | grep -qE '^<\?php(header\(["'"'"'](HTTP/[^"'"'"']*404[^"'"'"']*|Status:[^"'"'"']*404[^"'"'"']*)["'"'"']\);?)+(exit(\(\))?;?|die(\(\))?;?)?$'
 }
@@ -1644,29 +1703,10 @@ _rs_dataonly_has_long_line() {
     awk 'BEGIN{bad=0} { if (length($0) > 20480) bad=1 } END { exit (bad?0:1) }' "$1" 2>/dev/null
 }
 
-# _rs_dataonly_trailing_after_close FILE -> 0 (true) if the file's LAST "?>"
-# (if any) is followed by any non-whitespace content (RATSWEEPR-010/R1).
-_rs_dataonly_trailing_after_close() {
-    awk '
-        { buf = buf $0 "\n" }
-        END {
-            pos = 1; lastpos = 0
-            while (1) {
-                p = index(substr(buf, pos), "?>")
-                if (p == 0) break
-                lastpos = pos + p - 1
-                pos = lastpos + 2
-            }
-            if (lastpos == 0) exit 1
-            rest = substr(buf, lastpos + 2)
-            gsub(/[ \t\r\n]/, "", rest)
-            exit (length(rest) > 0 ? 0 : 1)
-        }
-    ' "$1" 2>/dev/null
-}
-
-# _rs_dataonly_tokenize reads a comment-stripped, <?php/?>-stripped PHP
-# statement body on stdin and exits 0 only if it is NOTHING but zero or more
+# _rs_dataonly_tokenize reads a <?php/?>-stripped PHP statement body on
+# stdin - comments are NOT pre-stripped (RATSWEEPR-011/R1: the tokenizer
+# consumes them itself, see skipws() below) - and exits 0 only if it is
+# NOTHING but zero or more
 # "$var = VALUE;" / "$var[KEY] = VALUE;" statements, where VALUE is itself
 # recursively: a quoted string with no unescaped quote and no backslash
 # escape other than \' \" \\ (RATSWEEPR-010: a \x.. or octal escape, used to
@@ -1683,15 +1723,53 @@ _rs_dataonly_trailing_after_close() {
 # cost stays O(n) even on a large $cw=array(...) with thousands of entries.
 _rs_dataonly_tokenize() {
     awk '
-    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
-    function skipws(s, pos,   c) {
-        while (pos <= length(s)) {
-            c = substr(s, pos, 1)
-            if (c == " " || c == "\t" || c == "\n" || c == "\r") pos++
-            else break
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); comment_bad = 0 }
+    # RATSWEEPR-011/R1: comments are no longer stripped by sed before this
+    # tokenizer runs (that threw away a real "<?= ...call()... ?>" hidden
+    # after a fake "// ?>"/"# ?>"/"/* ?>" along with the comment text). The
+    # tokenizer instead consumes a "//"/"#"/"/* */" comment itself, bounded
+    # to the current line ONLY (a "/* */" that does not close before the
+    # next newline is treated as malformed, not tolerated across lines), and
+    # sets comment_bad if "?>" appears anywhere inside the comment text it
+    # consumed - the file fails closed regardless of what the rest of the
+    # statement stream looks like.
+    function skipws(s, pos,   c, nl, slice, star) {
+        while (1) {
+            while (pos <= length(s)) {
+                c = substr(s, pos, 1)
+                if (c == " " || c == "\t" || c == "\n" || c == "\r") pos++
+                else break
+            }
+            if (substr(s, pos, 2) == "//" || substr(s, pos, 1) == "#") {
+                nl = index(substr(s, pos), "\n")
+                slice = (nl == 0) ? substr(s, pos) : substr(s, pos, nl - 1)
+                if (index(slice, "?>") > 0) comment_bad = 1
+                pos = pos + length(slice)
+                continue
+            }
+            if (substr(s, pos, 2) == "/*") {
+                nl = index(substr(s, pos), "\n")
+                slice = (nl == 0) ? substr(s, pos) : substr(s, pos, nl - 1)
+                star = index(slice, "*/")
+                if (star == 0) {
+                    comment_bad = 1
+                    pos = pos + length(slice)
+                    continue
+                }
+                if (index(substr(slice, 1, star + 1), "?>") > 0) comment_bad = 1
+                pos = pos + star + 1
+                continue
+            }
+            break
         }
         return pos
     }
+    # RATSWEEPR-011/R2: a double-quoted string containing an unescaped "$"
+    # or "{" is PHP string interpolation ("{$b()}", "{${call()}}", "$b") and
+    # is NOT data-only - only "\\", the matching quote, "\$" and "\{" are
+    # recognized escapes; any other backslash escape (\x.., octal, \n, ...)
+    # still fails closed, unchanged from RATSWEEPR-010. Single-quoted
+    # strings never interpolate in PHP and keep the original rule.
     function consume_string(s, pos,   q, i, c, nx, len) {
         len = length(s)
         q = substr(s, pos, 1)
@@ -1702,8 +1780,10 @@ _rs_dataonly_tokenize() {
             if (c == "\\") {
                 nx = substr(s, i + 1, 1)
                 if (nx == q || nx == "\\") { i += 2; continue }
+                if (q == DQ && (nx == "$" || nx == "{")) { i += 2; continue }
                 return -1
             }
+            if (q == DQ && (c == "$" || c == "{")) return -1
             if (c == q) return i + 1
             i++
         }
@@ -1783,7 +1863,7 @@ _rs_dataonly_tokenize() {
             if (substr(s, pos, 1) != ";") { ok = 0; break }
             pos = skipws(s, pos + 1)
         }
-        exit (ok ? 0 : 1)
+        exit ((ok && !comment_bad) ? 0 : 1)
     }
     '
 }
@@ -1809,19 +1889,13 @@ _rs_is_data_only_php() {
     # well below the old 2MB ceiling both to bound the tokenizer's work and
     # because nothing genuinely data-only is ever this large.
     [ "$sz" -le 300000 ] 2>/dev/null || return 1
-    grep -qE '<\?php|<\?=' "$f" 2>/dev/null || return 1
 
-    # RATSWEEPR-010/R1: more than one <?php, a ?> followed by non-whitespace
-    # content, or any line over 20KB is never data-only - checked on the RAW
-    # file, not the comment-stripped body (a literal "<?php" inside a
-    # comment would otherwise be stripped away and never counted here, but
-    # we deliberately count BEFORE stripping to stay conservative). Deliberately
-    # NOT "grep -c" (which counts matching LINES, not occurrences - two
-    # "<?php" on the SAME line would under-count as 1 and slip through) -
-    # "grep -o | wc -l" counts actual occurrences regardless of line layout.
-    local opens; opens="$(grep -oi '<?php' "$f" 2>/dev/null | wc -l | tr -d ' ')"
-    [ -n "$opens" ] && [ "$opens" -le 1 ] 2>/dev/null || return 1
-    _rs_dataonly_trailing_after_close "$f" && return 1
+    # RATSWEEPR-011/R1: the raw-file tag-shape gate replaces the old
+    # "<?php|<?=" existence check plus the ">1 <?php" / trailing-after-close
+    # checks - it is strictly stronger (it also counts "<?=" as an open tag,
+    # which the old "grep -oi '<?php'" counter never did, and it requires
+    # the single open tag to be a LEADING "<?php", not merely present).
+    _rs_raw_phptag_shape_ok "$f" || return 1
     _rs_dataonly_has_long_line "$f" && return 1
 
     # Hard disqualifiers anywhere in the RAW file - belt-and-suspenders on
@@ -1830,11 +1904,14 @@ _rs_is_data_only_php() {
     grep -qiE '\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES|ENV)\b|\$GLOBALS\b|`|\b(eval|assert|exec|system|shell_exec|passthru|popen|proc_open|call_user_func|call_user_func_array|file_put_contents|fwrite|fopen|file_get_contents|curl_init|curl_exec|unserialize|create_function)[[:space:]]*\(|base64_decode|gzinflate|gzuncompress|str_rot13|preg_replace[[:space:]]*\([[:space:]]*["'"'"'][^"'"'"']*/[a-zA-Z]*e[a-zA-Z]*["'"'"']|\b(include|require)(_once)?\b' "$f" 2>/dev/null \
         && return 1
 
-    local body scrubbed
-    body="$(sed -E 's#//.*$##; s/#.*$//' "$f" 2>/dev/null \
-        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g')"
-    scrubbed="$(printf '%s' "$body" \
-        | sed -E "s/if[[:space:]]*\([[:space:]]*!?[[:space:]]*defined[[:space:]]*\([[:space:]]*['\"]ABSPATH['\"][[:space:]]*\)[[:space:]]*\)[[:space:]]*(\{[[:space:]]*)?exit;?(\})?//g" \
+    # RATSWEEPR-011/R1: no sed-based // or # (or /* */) comment stripping
+    # here any more - that threw away a real "<?= ...call()... ?>" hidden
+    # after a fake "// ?>" along with the comment text. The raw-shape gate
+    # above already rejects any file carrying a second PHP tag of any kind;
+    # whatever comments remain in the body below are now handled, and
+    # checked for a hidden "?>", by _rs_dataonly_tokenize itself.
+    local scrubbed
+    scrubbed="$(sed -E "s/if[[:space:]]*\([[:space:]]*!?[[:space:]]*defined[[:space:]]*\([[:space:]]*['\"]ABSPATH['\"][[:space:]]*\)[[:space:]]*\)[[:space:]]*(\{[[:space:]]*)?exit;?(\})?//g" "$f" 2>/dev/null \
         | sed -E 's/<\?php//; s/<\?=//; s/\?>[[:space:]]*$//')"
 
     local bodyfile; bodyfile="$(rs_tmp dataonly-body)"
@@ -2627,7 +2704,12 @@ _rs_is_wordfence_prepend_legit() {
     case "$tfile" in "$WPROOT"/*) : ;; *) return 1 ;; esac
     tsz="$(wc -c < "$tfile" 2>/dev/null || echo 999999)"
     [ "$tsz" -le 2048 ] 2>/dev/null || return 1
-    stripped="$(sed -E 's#//.*$##' "$tfile" 2>/dev/null | tr -d '[:space:]')"
+    # RATSWEEPR-011/R1: no longer strips // comments before judging - that
+    # threw away a real "<?= ...call()... ?>" hidden after a fake "// ?>"
+    # along with the comment; the raw-shape gate rejects any such file
+    # outright before the dangerous-token/shape checks below ever run.
+    _rs_raw_phptag_shape_ok "$tfile" || return 1
+    stripped="$(tr -d '[:space:]' < "$tfile" 2>/dev/null)"
     case "$stripped" in
         *eval\(*|*base64_decode\(*|*gzinflate\(*|*gzuncompress\(*|*system\(*|*exec\(*|*passthru\(*|*assert\(*|*curl_*|*'$_GET'*|*'$_POST'*|*'$_REQUEST'*|*'$_COOKIE'*|*'$_SERVER'*)
             return 1 ;;
@@ -2666,10 +2748,13 @@ _rs_is_wordfence_waf_bootstrap_legit() {
     [ -d "$WPROOT/wp-content/plugins/wordfence/waf" ] || return 1
     local sz; sz="$(wc -c < "$f" 2>/dev/null || echo 999999)"
     [ "$sz" -le 2048 ] 2>/dev/null || return 1
+    # RATSWEEPR-011/R1: no longer strips // or /* */ comments before
+    # judging - that threw away a real "<?= ...call()... ?>" hidden after a
+    # fake "// ?>"/"/* ?>" along with the comment; the raw-shape gate
+    # rejects any such file outright before the exact-match checks below.
+    _rs_raw_phptag_shape_ok "$f" || return 1
 
-    norm="$(sed -E 's#//.*$##' "$f" 2>/dev/null \
-        | sed -E 's#/\*[^*]*\*+([^/*][^*]*\*+)*/##g' \
-        | tr -d '[:space:]')"
+    norm="$(tr -d '[:space:]' < "$f" 2>/dev/null)"
     norm="${norm%\?>}"
 
     local type tmpl
@@ -6190,7 +6275,23 @@ selftest() {
     printf '%s\n' '<?php $a = 1; <?php $b = 2;' > "$dir/d4.php"
     printf '%s\n' '<?php $a = 1; ?> trailing <?php' > "$dir/d5.php"
     printf '%s\n' "<?php if(!defined('ABSPATH')) exit; \$a = shell_exec(\$_GET['x']);" > "$dir/d6.php"
-    for f in d1 d2 d3 d4 d5 d6; do
+    # --- RATSWEEPR-011/R3: comment-stripping and string-interpolation
+    #     bypasses - PHP ends a "//"/"#" comment early at the first "?>" it
+    #     sees, so a classifier that stripped comments with sed BEFORE
+    #     judging threw away a real, executable "<?= placeholder_call() ?>"
+    #     along with the fake comment; and the old tokenizer accepted ANY
+    #     content inside a double-quoted string, including interpolation. ---
+    printf '%s\n' '<?php' > "$dir/d7.php"
+    printf '%s\n' '$a = 1; // ?><?= placeholder_call() ?>' >> "$dir/d7.php"
+    printf '%s\n' '<?php' > "$dir/d8.php"
+    printf '%s\n' '$a = 1; # ?><?= placeholder_call() ?>' >> "$dir/d8.php"
+    printf '%s\n' '<?php' > "$dir/d9.php"
+    printf '%s\n' '$a = 1; /* ?><?= placeholder_call() ?> */' >> "$dir/d9.php"
+    printf '%s\n' '<?php $a = "{${placeholder_call()}}";' > "$dir/d10.php"
+    printf '%s\n' '<?php $a = "{$b()}";' > "$dir/d11.php"
+    printf '%s\n' '<?php $a = "$b";' > "$dir/d12.php"
+    printf '%s' '<?= 1 ?>' > "$dir/d13.php"
+    for f in d1 d2 d3 d4 d5 d6 d7 d8 d9 d10 d11 d12 d13; do
         if _rs_is_data_only_php "$dir/$f.php"; then
             bad "selftest FAIL: _rs_is_data_only_php wrongly cleared $f.php"; fail=1
         else
@@ -6212,6 +6313,20 @@ selftest() {
     else
         bad "selftest FAIL: _rs_is_data_only_php wrongly rejected a legitimate font-definition file"; fail=1
     fi
+    # A font file carrying genuine, non-malicious "//" comments (RATSWEEPR-
+    # 011/R1 requires the tokenizer itself, not sed, to tolerate these) must
+    # also still clear.
+    {
+        printf '%s\n' '<?php'
+        printf '%s\n' '// font metrics table'
+        printf '%s\n' "\$type='TrueTypeUnicode'; // type"
+        printf '%s\n' "\$name='Helvetica';"
+    } > "$dir/good_font_commented.php"
+    if _rs_is_data_only_php "$dir/good_font_commented.php"; then
+        ok "selftest: _rs_is_data_only_php correctly cleared good_font_commented.php"
+    else
+        bad "selftest FAIL: _rs_is_data_only_php wrongly rejected a legitimate commented font-definition file"; fail=1
+    fi
 
     # --- _rs_is_404_stub: a Location: redirect must stay HIGH, a real 404 must clear ---
     printf '%s\n' '<?php header("Location: https://example.invalid/404");' > "$dir/stub_bad.php"
@@ -6219,6 +6334,14 @@ selftest() {
         bad "selftest FAIL: _rs_is_404_stub wrongly cleared a Location-redirect header"; fail=1
     else
         ok "selftest: _rs_is_404_stub correctly rejected stub_bad.php"
+    fi
+    # RATSWEEPR-011/R3: the same genuine stub with a "// ?><?= ...?>" trick
+    # appended must also stay HIGH.
+    printf '%s' '<?php header("HTTP/1.0 404 Not Found"); exit;// ?><?= placeholder_call() ?>' > "$dir/stub_bad2.php"
+    if _rs_is_404_stub "$dir/stub_bad2.php"; then
+        bad "selftest FAIL: _rs_is_404_stub wrongly cleared a stub with an appended // ?><?= trick"; fail=1
+    else
+        ok "selftest: _rs_is_404_stub correctly rejected stub_bad2.php"
     fi
     printf '%s\n' '<?php header("HTTP/1.0 404 Not Found"); exit;' > "$dir/stub_good.php"
     if _rs_is_404_stub "$dir/stub_good.php"; then
@@ -6277,6 +6400,21 @@ selftest() {
         bad "selftest FAIL: _rs_is_wordfence_waf_bootstrap_legit wrongly cleared a second include of another path"; fail=1
     else
         ok "selftest: _rs_is_wordfence_waf_bootstrap_legit correctly rejected a second include of another path"
+    fi
+
+    # RATSWEEPR-011/R3: the genuine shape with a "// ?><?= ...?>" trick
+    # appended on the closing brace line must also stay HIGH.
+    {
+        printf '%s\n' '<?php'
+        printf '%s\n' "if (file_exists(__DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php')) {"
+        printf '%s\n' "    define('WFWAF_LOG_PATH', __DIR__ . '/wp-content/wflogs/');"
+        printf '%s\n' "    include_once __DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php';"
+        printf '%s' "}// ?><?= placeholder_call() ?>"
+    } > "$wftarget"
+    if _rs_is_wordfence_waf_bootstrap_legit "$wftarget"; then
+        bad "selftest FAIL: _rs_is_wordfence_waf_bootstrap_legit wrongly cleared the bootstrap + an appended // ?><?= trick"; fail=1
+    else
+        ok "selftest: _rs_is_wordfence_waf_bootstrap_legit correctly rejected the bootstrap + an appended // ?><?= trick"
     fi
 
     rm -rf "$dir"
